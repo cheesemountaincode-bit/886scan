@@ -1,962 +1,1216 @@
-# 886strat
-# 0.886 → 0.618 Scanner (Trend-segment + explosivt filter + EMA-surf 10/20/50)
-# Källor: Bybit (ccxt), Yahoo (manuell/.ST-beta), Avanza CSV, Stooq (daglig)
-# Inkl: multi-pivot, strikt-regel, kvalitetsdiagnostik, och EMA-surf-filter
+# app.py
+# Bybit PERPETUALS (USDT-linear) – Trades, PnL, MA-Stop & MA-TP (CLOSE-only) + Winrate (med counts)
+# + Konto-saldo & Positionsstorlek (risk i % av konto)
+# Innehåller: jämförelse, exit-markörer + chart, auto-optimering, projektion, Plotly-fallback, WIN/LOSS-COUNTS
 
-import statistics
-from datetime import datetime, timezone
-import re, requests
-import streamlit as st
-import ccxt
+import time
+import hmac
+import hashlib
+from typing import Any, Dict, List, Tuple, Optional
+from urllib.parse import urlencode
+
+import requests
 import pandas as pd
-import yfinance as yf
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import numpy as np
+import streamlit as st
 
+# Plotly (valfritt, med graceful fallback)
 try:
-    from pandas_datareader import data as pdr
+    import plotly.graph_objects as go
+    PLOTLY_AVAILABLE = True
 except Exception:
-    pdr = None
+    PLOTLY_AVAILABLE = False
 
-# =========================
-# Hjälpfunktioner (generella)
-# =========================
+# ====== FYLL I DINA NYCKLAR (Bybit v5 – helst Unified Account) ======
+API_KEY    = "Klgy68UfhEnZtrYicm"   # låtsasnyckel
+API_SECRET = "LPfJxAploIR3MAhFvSsDUfqvudXi6MhmsoYX"  # låtsashemlighet
 
-def ts(ms):
-    return datetime.fromtimestamp(ms/1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+# ====== KONFIG ======
+BYBIT_BASE = "https://api.bybit.com"   # v5
+RECV_WINDOW = "5000"
 
-def fetch_ohlcv_safe(ex, symbol, timeframe, limit):
-    return ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+# ====== INIT STATE ======
+if "trades_df" not in st.session_state:
+    st.session_state["trades_df"] = None
+if "opt_open" not in st.session_state:
+    st.session_state["opt_open"] = False
+if "opt_results" not in st.session_state:
+    st.session_state["opt_results"] = None
+if "opt_stop_periods" not in st.session_state:
+    st.session_state["opt_stop_periods"] = [10, 20, 50]
+if "opt_stop_tfs" not in st.session_state:
+    st.session_state["opt_stop_tfs"] = ["5m", "10m", "15m", "60m"]
+if "opt_tp_periods" not in st.session_state:
+    st.session_state["opt_tp_periods"] = [10, 20, 50]
+if "opt_tp_tfs" not in st.session_state:
+    st.session_state["opt_tp_tfs"] = ["5m", "10m", "15m", "60m"]
+if "allow_after_default" not in st.session_state:
+    st.session_state["allow_after_default"] = True
+if "acct_balance" not in st.session_state:
+    st.session_state["acct_balance"] = None
 
-def load_usdt_perp_symbols(ex):
-    ex.load_markets()
-    return [s for s, m in ex.markets.items()
-            if m.get("active", True) and m.get("swap") and m.get("quote") == "USDT"]
-
-def atr_like_vol(ohlcv, lookback):
-    vals = []
-    for _, o, h, l, c, v in ohlcv[-lookback:]:
-        if c:
-            vals.append((h - l) / c)
-    return statistics.mean(vals) if vals else 0.0
-
-def pct_dist(a, b):
-    if b == 0 or a is None or b is None:
-        return None
-    return (a - b) / b * 100.0
-
-def build_tradingview_url(ccxt_symbol: str):
-    try:
-        base = ccxt_symbol.split("/")[0]
-        quote_part = ccxt_symbol.split("/")[1]
-        quote = quote_part.split(":")[0]
-    except Exception:
-        return None
-    tv_symbol = f"BYBIT:{base}{quote}.P"
-    return f"https://www.tradingview.com/chart/?symbol={tv_symbol}"
-
-# =========================
-# EMA & trendsegment
-# =========================
-
-def ema_series(values, length):
-    out = [None] * len(values)
-    if not values:
-        return out
-    k = 2 / (length + 1)
-    e = values[0]
-    for i, v in enumerate(values):
-        if i == 0:
-            e = v
-        else:
-            e = v * k + e * (1 - k)
-        if i >= length - 1:
-            out[i] = e
-    return out
-
-def current_trend_and_segment_start(ohlcv):
-    closes = [x[4] for x in ohlcv]
-    e50 = ema_series(closes, 50)
-    e200 = ema_series(closes, 200)
-    n = len(closes)
-    if n < 210 or e50[-1] is None or e200[-1] is None:
-        return None, None
-    up_now = (e50[-1] > e200[-1] and closes[-1] > e200[-1])
-    down_now = (e50[-1] < e200[-1] and closes[-1] < e200[-1])
-    if not up_now and not down_now:
-        return None, None
-    side = 'up' if up_now else 'down'
-    seg_start = None
-    for i in range(n - 2, 0, -1):
-        if None in (e50[i], e200[i], e50[i-1], e200[i-1]):
-            continue
-        crossed_up = (e50[i-1] <= e200[i-1]) and (e50[i] > e200[i])
-        crossed_down = (e50[i-1] >= e200[i-1]) and (e50[i] < e200[i])
-        if side == 'up' and crossed_up:
-            seg_start = i
-            break
-        if side == 'down' and crossed_down:
-            seg_start = i
-            break
-    if seg_start is None:
-        seg_start = max(0, n - 400)
-    return side, seg_start
-
-# =========================
-# Pivot-detektering (segment)
-# =========================
-
-def find_first_red_indices_in_segment(ohlcv, seg_start):
-    o=[x[1] for x in ohlcv]; c=[x[4] for x in ohlcv]
-    idxs=[]
-    for i in range(max(2, seg_start+1), len(ohlcv)-1):
-        if c[i] < o[i] and (c[i-1] > o[i-1] or c[i-2] > o[i-2]):
-            idxs.append(i)
-    return idxs
-
-def find_first_green_indices_in_segment(ohlcv, seg_start):
-    o=[x[1] for x in ohlcv]; c=[x[4] for x in ohlcv]
-    idxs=[]
-    for i in range(max(2, seg_start+1), len(ohlcv)-1):
-        if c[i] > o[i] and (c[i-1] < o[i-1] or c[i-2] < o[i-2]):
-            idxs.append(i)
-    return idxs
-
-# =========================
-# Setup från pivot
-# =========================
-
-def setup_up_from_index_segment(ohlcv, r_idx, segment_start, include_turn_wick=True,
-                                use_segment_extreme=False):
-    if r_idx is None or r_idx <= segment_start:
-        return None
-    o=[x[1] for x in ohlcv]; h=[x[2] for x in ohlcv]; l=[x[3] for x in ohlcv]; c=[x[4] for x in ohlcv]
-    high_slice_end = r_idx + (1 if include_turn_wick else 0)
-    if use_segment_extreme:
-        if high_slice_end <= segment_start:
-            return None
-        top_price = max(h[segment_start:high_slice_end])
-    else:
-        j = r_idx - 1
-        if j < segment_start:
-            return None
-        first_green = j
-        while first_green >= segment_start and c[first_green] > o[first_green]:
-            first_green -= 1
-        first_green += 1
-        if first_green > j:
-            return None
-        top_price = max(h[first_green:high_slice_end])
-    bottom_low = l[r_idx]
-    freeze_idx = r_idx
-    k = r_idx + 1
-    while k < len(ohlcv) and c[k] < o[k]:
-        bottom_low = min(bottom_low, l[k]); freeze_idx = k; k += 1
-    span = top_price - bottom_low
-    if span <= 0: return None
-    level886 = bottom_low + 0.886 * span
-    level618 = bottom_low + 0.618 * span
-    return {"mode":"up","first_idx":r_idx,"freeze_idx":freeze_idx,
-            "top":top_price,"bottom":bottom_low,"span":span,
-            "level886":level886,"level618":level618}
-
-def setup_down_from_index_segment(ohlcv, g_idx, segment_start, include_turn_wick=True,
-                                  use_segment_extreme=False):
-    if g_idx is None or g_idx <= segment_start:
-        return None
-    o=[x[1] for x in ohlcv]; h=[x[2] for x in ohlcv]; l=[x[3] for x in ohlcv]; c=[x[4] for x in ohlcv]
-    low_slice_end = g_idx + (1 if include_turn_wick else 0)
-    if use_segment_extreme:
-        if low_slice_end <= segment_start: return None
-        bottom_low = min(l[segment_start:low_slice_end])
-    else:
-        j = g_idx - 1
-        if j < segment_start: return None
-        first_red = j
-        while first_red >= segment_start and c[first_red] < o[first_red]:
-            first_red -= 1
-        first_red += 1
-        if first_red > j: return None
-        bottom_low = min(l[first_red:low_slice_end])
-    top_high = h[g_idx]
-    freeze_idx = g_idx
-    k = g_idx + 1
-    while k < len(ohlcv) and c[k] > o[k]:
-        top_high = max(top_high, h[k]); freeze_idx = k; k += 1
-    span = top_high - bottom_low
-    if span <= 0: return None
-    level886 = top_high - 0.886 * span
-    level618 = top_high - 0.618 * span
-    return {"mode":"down","first_idx":g_idx,"freeze_idx":freeze_idx,
-            "top":top_high,"bottom":bottom_low,"span":span,
-            "level886":level886,"level618":level618}
-
-# =========================
-# Strikt-regel hjälpare
-# =========================
-
-def broke_top_since(ohlcv, start_idx, top):
-    for i in range(start_idx + 1, len(ohlcv)):
-        if ohlcv[i][2] > top:
-            return True
-    return False
-
-def broke_bottom_since(ohlcv, start_idx, bottom):
-    for i in range(start_idx + 1, len(ohlcv)):
-        if ohlcv[i][3] < bottom:
-            return True
-    return False
-
-# =========================
-# Sekvensdetektorer (0.886 → 0.618)
-# =========================
-
-def detect_up_0886_then_0618(ohlcv, setup,
-                             tol_886=0.0006, tol_618=0.0008,
-                             invalidate_on_new_low=True,
-                             max_bars=0):
-    level886=setup["level886"]; level618=setup["level618"]
-    bottom=setup["bottom"]; top=setup["top"]; fr=setup["freeze_idx"]
-    lo_886 = level886*(1 - tol_886); hi_618 = level618*(1 + tol_618)
-    touch_idx=None
-    for i in range(fr+1, len(ohlcv)):
-        _, o, h, l, c, v = ohlcv[i]
-        if h > top: return {"ok":False,"reason":"broke_top_before_0886"}
-        if invalidate_on_new_low and l < bottom: return {"ok":False,"reason":"new_low_before_0886"}
-        if h >= lo_886: touch_idx=i; break
-    if touch_idx is None: return {"ok":False,"reason":"no_0886_touch"}
-    retrace_idx=None
-    for j in range(touch_idx+1, len(ohlcv)):
-        _, o, h, l, c, v = ohlcv[j]
-        if h > top: return {"ok":False,"reason":"broke_top_before_0618"}
-        if invalidate_on_new_low and l < bottom: return {"ok":False,"reason":"new_low_before_0618"}
-        if l <= hi_618: retrace_idx=j; break
-        if max_bars and (j - touch_idx) > max_bars:
-            return {"ok":False,"reason":"too_many_bars_between_touch_and_retrace"}
-    if retrace_idx is None: return {"ok":False,"reason":"no_0618_retrace_after_0886"}
-    if broke_top_since(ohlcv, fr, top): return {"ok":False,"reason":"broke_top_after_sequence"}
-    return {"ok":True,"touch_idx":touch_idx,"retrace_idx":retrace_idx}
-
-def detect_down_0886_then_0618(ohlcv, setup,
-                               tol_886=0.0006, tol_618=0.0008,
-                               invalidate_on_new_high=True,
-                               max_bars=0):
-    level886=setup["level886"]; level618=setup["level618"]
-    top=setup["top"]; bottom=setup["bottom"]; fr=setup["freeze_idx"]
-    hi_886 = level886*(1 + tol_886); lo_618 = level618*(1 - tol_618)
-    touch_idx=None
-    for i in range(fr+1, len(ohlcv)):
-        _, o, h, l, c, v = ohlcv[i]
-        if l < bottom: return {"ok":False,"reason":"broke_bottom_before_0886"}
-        if invalidate_on_new_high and h > top: return {"ok":False,"reason":"new_high_before_0886"}
-        if l <= hi_886: touch_idx=i; break
-    if touch_idx is None: return {"ok":False,"reason":"no_0886_touch"}
-    retrace_idx=None
-    for j in range(touch_idx+1, len(ohlcv)):
-        _, o, h, l, c, v = ohlcv[j]
-        if l < bottom: return {"ok":False,"reason":"broke_bottom_before_0618"}
-        if invalidate_on_new_high and h > top: return {"ok":False,"reason":"new_high_before_0618"}
-        if h >= lo_618: retrace_idx=j; break
-        if max_bars and (j - touch_idx) > max_bars:
-            return {"ok":False,"reason":"too_many_bars_between_touch_and_retrace"}
-    if retrace_idx is None: return {"ok":False,"reason":"no_0618_retrace_after_0886"}
-    if broke_bottom_since(ohlcv, fr, bottom): return {"ok":False,"reason":"broke_bottom_after_sequence"}
-    return {"ok":True,"touch_idx":touch_idx,"retrace_idx":retrace_idx}
-
-# =========================
-# Explosive-move detection
-# =========================
-
-def _ema(values, n):
-    if not values: return []
-    k = 2/(n+1); out=[]; e=None
-    for v in values:
-        e = v if e is None else v*k + e*(1-k)
-        out.append(e)
-    return out
-
-def _rolling_atr_like(ohlcv, n=14):
-    h=[x[2] for x in ohlcv]; l=[x[3] for x in ohlcv]; c=[x[4] for x in ohlcv]
-    tr=[(h[i]-l[i])/max(c[i],1e-12) for i in range(len(ohlcv))]
-    return _ema(tr, n)
-
-def detect_explosive_windows_dir(ohlcv, win=3, min_move_pct=6.0, atr_mult=1.8, vol_mult=2.0):
-    n=len(ohlcv)
-    if n < win+25: return set(), set()
-    c=[x[4] for x in ohlcv]; v=[x[5] for x in ohlcv]
-    atr14=_rolling_atr_like(ohlcv, 14); v_ema20=_ema(v, 20)
-    up=set(); down=set()
-    for end in range(win-1, n):
-        start=end-(win-1)
-        c0=max(c[start],1e-12)
-        c_move=(c[end]-c[start])/c0*100.0
-        tr_mean=sum((ohlcv[i][2]-ohlcv[i][3])/max(c[i],1e-12) for i in range(start,end+1))/win
-        atr_ref = atr14[end-1] if (end-1) < len(atr14) and atr14[end-1] is not None else (atr14[end] if end < len(atr14) else None)
-        if atr_ref is None: continue
-        vol_sum=sum(v[i] for i in range(start,end+1))
-        vol_ref=(v_ema20[end] or 0.0)*win
-        if vol_ref<=0: continue
-        if abs(c_move) >= min_move_pct and tr_mean >= atr_mult*atr_ref and vol_sum >= vol_mult*vol_ref:
-            if c_move > 0: up.add(end)
-            elif c_move < 0: down.add(end)
-    return up, down
-
-def has_burst_before(index, bursts_set, lookback=20):
-    lo=max(0, index-lookback)
-    for j in range(lo, index):
-        if j in bursts_set: return True
-    return False
-
-# =========================
-# Yahoo & Stooq OHLCV
-# =========================
-
-YF_INTERVAL_MAP = {
-    "15m": "15m", "30m": "30m", "1h": "60m", "2h": "60m",
-    "4h": "60m", "6h": "60m", "12h": "60m", "1d": "1d"
-}
-
-def fetch_ohlcv_yf(symbol, timeframe, limit):
-    interval = YF_INTERVAL_MAP.get(timeframe, None)
-    if interval is None:
-        raise ValueError(f"Timeframe {timeframe} stöds ej av Yahoo (stöd: 15m/30m/1h/1d).")
-    period = "60d" if interval.endswith("m") else "10y"
-    df = yf.download(symbol, period=period, interval=interval, auto_adjust=False, progress=False)
-    if df is None or df.empty: return []
-    df = df.dropna()
-    if limit and len(df) > limit: df = df.iloc[-limit:]
-    out = []
-    for ts_idx, row in df.iterrows():
-        ms = int(pd.Timestamp(ts_idx).tz_localize(None).timestamp() * 1000)
-        o = float(row["Open"]); h = float(row["High"]); l = float(row["Low"]); c = float(row["Close"]); v = float(row["Volume"])
-        out.append([ms, o, h, l, c, v])
-    return out
-
-def fetch_ohlcv_stooq(symbol, timeframe, limit):
-    if pdr is None:
-        raise RuntimeError("pandas_datareader saknas. Installera: pip install pandas-datareader")
-    if timeframe != "1d":
-        raise ValueError("Stooq stöder endast '1d' i denna app.")
-    try:
-        df = pdr.DataReader(symbol, "stooq")
-    except Exception:
-        return []
-    if df is None or df.empty: return []
-    df = df.sort_index()
-    if limit and len(df) > limit: df = df.iloc[-limit:]
-    out = []
-    for ts_idx, row in df.iterrows():
-        ms = int(pd.Timestamp(ts_idx).tz_localize(None).timestamp() * 1000)
-        o = float(row["Open"]); h = float(row["High"]); l = float(row["Low"]); c = float(row["Close"]); v = float(row.get("Volume", 0.0) or 0.0)
-        out.append([ms, o, h, l, c, v])
-    return out
-
-# =========================
-# Avanza CSV & Yahoo (alla .ST)
-# =========================
-
-def load_avanza_csv(uploaded_file):
-    try:
-        df = pd.read_csv(uploaded_file, sep=";")
-    except Exception:
-        df = pd.read_csv(uploaded_file)
-    tickers = []
-    for col in ["Beteckning", "Namn", "Ticker", "Symbol"]:
-        if col in df.columns:
-            tickers = df[col].dropna().astype(str).str.strip().unique().tolist()
-            break
-    out = []
-    for t in tickers:
-        t = t.strip()
-        if "." in t: out.append(t)
-        else: out.append(f"{t}.ST")
-    return out
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def get_all_yahoo_st_tickers():
-    urls = [
-        "https://en.wikipedia.org/wiki/NASDAQ_OMX_Stockholm",
-        "https://en.wikipedia.org/wiki/OMX_Stockholm_30",
-        "https://sv.wikipedia.org/wiki/Nasdaq_Stockholm",
-        "https://en.wikipedia.org/wiki/OMX_Stockholm_Large_Cap",
-        "https://en.wikipedia.org/wiki/OMX_Stockholm_Mid_Cap",
-        "https://en.wikipedia.org/wiki/OMX_Stockholm_Small_Cap",
-    ]
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; scanner/1.0)"}
-    found = set()
-    def norm(x: str) -> str:
-        x = x.strip().upper().replace(" ", "")
-        if not x: return ""
-        if not x.endswith(".ST"): x = f"{x}.ST"
-        return x
-    for url in urls:
-        try:
-            resp = requests.get(url, headers=headers, timeout=15)
-            if resp.status_code != 200 or not resp.text: continue
-            try:
-                tables = pd.read_html(resp.text)
-                for df in tables:
-                    for col in df.columns:
-                        col_l = str(col).lower()
-                        if any(k in col_l for k in ["ticker","symbol","short","kod","beteckning"]):
-                            vals = df[col].dropna().astype(str).str.replace(r"[*\s]", "", regex=True).tolist()
-                            for v in vals:
-                                if not v: continue
-                                if v.endswith(".ST"): found.add(v.upper())
-                                else: found.add(norm(v))
-            except Exception:
-                pass
-            for m in re.finditer(r"\b([A-ZÅÄÖ0-9\-]{1,12})\.ST\b", resp.text, flags=re.IGNORECASE):
-                found.add(m.group(0).upper())
-        except Exception:
-            continue
-    cleaned = sorted({t for t in found if len(t) > 3 and t.endswith(".ST")})
-    return cleaned
-
-# =========================
-# Diagnostik / kvalitet
-# =========================
-
-def rolling_atr_points(ohlcv, n=14):
-    h=[x[2] for x in ohlcv]; l=[x[3] for x in ohlcv]
-    tr=[(h[i]-l[i]) for i in range(len(ohlcv))]
-    return _ema(tr, n)
-
-def advance_ratio(ohlcv, i0, i1, up=True):
-    o=[x[1] for x in ohlcv]; c=[x[4] for x in ohlcv]
-    if i1 <= i0: return 0.0
-    seg = range(max(0,i0), min(len(ohlcv)-1, i1)+1)
-    if up:
-        greens = sum(1 for i in seg if c[i] > o[i])
-        total  = len(list(seg))
-        return greens/total if total else 0.0
-    else:
-        reds = sum(1 for i in seg if c[i] < o[i])
-        total = len(list(seg))
-        return reds/total if total else 0.0
-
-def compute_quality_and_debug(ohlcv, setup, seq, bursts_set, burst_win, burst_lookback, mode):
-    atr_pts = rolling_atr_points(ohlcv, 14)
-    fr = setup["freeze_idx"]; touch = seq["touch_idx"]
-    span_pts = abs(setup["top"] - setup["bottom"])
-    atr_here = atr_pts[touch] if touch < len(atr_pts) and atr_pts[touch] else (atr_pts[fr] if fr < len(atr_pts) else None)
-    span_atr_mult = (span_pts / atr_here) if atr_here and atr_here > 0 else None
-    burst_end = None
-    if bursts_set:
-        for j in range(max(0, setup["first_idx"]-burst_lookback), setup["first_idx"]):
-            if j in bursts_set: burst_end = j
-    bars_burst_to_pivot = (setup["first_idx"] - burst_end) if burst_end is not None else None
-    burst_move = None
-    if burst_end is not None:
-        c=[x[4] for x in ohlcv]; start = max(0, burst_end-(burst_win-1))
-        burst_move = (c[burst_end]-c[start])/max(c[start],1e-12)*100.0
-    adv = advance_ratio(ohlcv, fr+1, touch, up=(mode=="up"))
-    score = 0.0
-    if span_atr_mult is not None: score += max(0.0, min(1.0, (span_atr_mult-1.0)/3.0)) * 40
-    if burst_move is not None:    score += max(0.0, min(1.0, (abs(burst_move)-4.0)/6.0)) * 25
-    score += max(0.0, min(1.0, adv)) * 20
-    score += max(0, 10 - max(0, seq["retrace_idx"] - seq["touch_idx"])) * 1.5
+# ====== SIGNERING / HTTP ======
+def _bybit_headers(api_key: str, api_secret: str, query_str: str = "", body_str: str = "") -> Dict[str, str]:
+    ts = str(int(time.time() * 1000))
+    payload = ts + api_key + RECV_WINDOW + (body_str if body_str else query_str)
+    sign = hmac.new(api_secret.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
     return {
-        "Span/ATR14": None if span_atr_mult is None else float(f"{span_atr_mult:.2f}"),
-        "Burst→Pivot bars": bars_burst_to_pivot,
-        "Burst move %": None if burst_move is None else float(f"{burst_move:.2f}"),
-        "Advance ratio": float(f"{adv:.2f}"),
-        "Quality": float(f"{score:.1f}")
+        "X-BAPI-API-KEY": api_key,
+        "X-BAPI-TIMESTAMP": ts,
+        "X-BAPI-RECV-WINDOW": RECV_WINDOW,
+        "X-BAPI-SIGN": sign,
+        "Content-Type": "application/json",
     }
 
-# =========================
-# EMA-surf (10/20/50) – nytt
-# =========================
+def bybit_get(endpoint: str, params: Dict[str, Any], api_key: Optional[str]=None, api_secret: Optional[str]=None) -> Dict[str, Any]:
+    encoded_query = urlencode(sorted(params.items()))
+    headers = _bybit_headers(api_key, api_secret, query_str=encoded_query) if api_key and api_secret else None
+    url = f"{BYBIT_BASE}{endpoint}?{encoded_query}"
+    r = requests.get(url, headers=headers, timeout=30)
+    r.raise_for_status()
+    return r.json()
 
-def check_ema_surf(ohlcv, i0, i1, mode, close_only, allow10, allow20, strict50=True):
+# ====== SALDO (Wallet balance) ======
+def fetch_wallet_balance(api_key: str, api_secret: str, account_type: str = "UNIFIED", coin: Optional[str] = "USDT") -> Dict[str, Any]:
     """
-    Kollar att pris "surfar" på EMA10/20 (få brott) och aldrig bryter EMA50 om strict50=True.
-    mode='up'  : vill ha C(eller L) >= EMA10/20 mestadels; aldrig under EMA50
-    mode='down': vill ha C(eller H) <= EMA10/20 mestadels; aldrig över EMA50
-    Returnerar (ok, breaches10, breaches20, breaches50)
+    account_type: "UNIFIED" för Unified Trading Account eller "CONTRACT" för klassiskt derivatkonto.
+    coin: t.ex. "USDT" eller None för alla coins.
     """
-    if i1 <= i0: return True, 0, 0, 0
-    c=[x[4] for x in ohlcv]; h=[x[2] for x in ohlcv]; l=[x[3] for x in ohlcv]
-    e10 = ema_series(c, 10); e20 = ema_series(c, 20); e50 = ema_series(c, 50)
-    b10=b20=b50=0
-    for i in range(max(0,i0), min(len(ohlcv)-1, i1)+1):
-        if e50[i] is None or e20[i] is None or e10[i] is None: continue
-        if mode == "up":
-            ref10 = (c[i] if close_only else l[i]); ref20 = (c[i] if close_only else l[i]); ref50 = (c[i] if close_only else l[i])
-            if ref10 < e10[i]: b10 += 1
-            if ref20 < e20[i]: b20 += 1
-            if strict50 and ref50 < e50[i]: b50 += 1
+    params: Dict[str, Any] = {"accountType": account_type}
+    if coin:
+        params["coin"] = coin
+    data = bybit_get("/v5/account/wallet-balance", params, api_key, api_secret)
+    if str(data.get("retCode")) != "0":
+        raise RuntimeError(f"Bybit API fel: {data.get('retCode')} - {data.get('retMsg')}")
+    result = data.get("result") or {}
+    lst = result.get("list") or []
+    if not lst:
+        return {}
+    acct = lst[0]
+    coins = acct.get("coin") or []
+    if coin and coins:
+        c = coins[0]
+        avail = c.get("availableToWithdraw")
+        if avail is None:
+            avail = c.get("availableBalance")
+        return {
+            "accountType": acct.get("accountType"),
+            "coin": c.get("coin"),
+            "equity": float(c.get("equity", 0)),
+            "walletBalance": float(c.get("walletBalance", 0)),
+            "available": float(avail or 0),
+            "unrealisedPnl": float(c.get("unrealisedPnl", 0)),
+            "cumRealisedPnl": float(c.get("cumRealisedPnl", 0)),
+            "totalMarginBalance": float(c.get("totalMarginBalance", 0)),
+        }
+    out = {"accountType": acct.get("accountType"), "coins": []}
+    for c in coins:
+        avail = c.get("availableToWithdraw")
+        if avail is None:
+            avail = c.get("availableBalance")
+        out["coins"].append({
+            "coin": c.get("coin"),
+            "equity": float(c.get("equity", 0)),
+            "walletBalance": float(c.get("walletBalance", 0)),
+            "available": float(avail or 0),
+            "unrealisedPnl": float(c.get("unrealisedPnl", 0)),
+        })
+    return out
+
+# ====== POSITION SIZE & R/R ======
+def calc_position_size(
+    side: str,
+    entry: float,
+    stop: float,
+    equity: float,
+    risk_pct: float,
+    fee_buffer_pct: float = 0.10,   # t.ex. 0.10% = 0.001
+    leverage: float = 1.0,
+    available: Optional[float] = None
+) -> Dict[str, float]:
+    """
+    USDT-linear: risk ($) per kontrakt ≈ |entry - stop|.
+    qty = (riskbelopp efter buffert) / |entry - stop|
+    """
+    side = (side or "").lower().strip()
+    if entry <= 0 or stop <= 0 or equity <= 0 or risk_pct <= 0:
+        return {"qty": 0.0, "notional": 0.0, "init_margin": 0.0, "risk_amount_usdt": 0.0, "capped": 0.0}
+
+    price_risk = abs(entry - stop)
+    if price_risk <= 0:
+        return {"qty": 0.0, "notional": 0.0, "init_margin": 0.0, "risk_amount_usdt": 0.0, "capped": 0.0}
+
+    risk_amount = equity * (risk_pct / 100.0)
+    effective_risk = risk_amount * (1.0 - (fee_buffer_pct / 100.0))
+    if effective_risk <= 0:
+        effective_risk = risk_amount
+
+    qty = effective_risk / price_risk
+    notional = qty * entry
+    lev = max(1.0, float(leverage))
+    init_margin = notional / lev
+
+    capped = 0.0
+    if available is not None and available > 0:
+        max_notional = float(available) * lev
+        if notional > max_notional:
+            qty_cap = max_notional / entry
+            capped = 1.0
+            qty = qty_cap
+            notional = qty * entry
+            init_margin = notional / lev
+
+    return {
+        "qty": float(qty),
+        "notional": float(notional),
+        "init_margin": float(init_margin),
+        "risk_amount_usdt": float(risk_amount),
+        "capped": float(capped)
+    }
+
+def calc_rr(side: str, entry: float, stop: float, tp: Optional[float]) -> Dict[str, float]:
+    if entry <= 0 or stop <= 0:
+        return {"risk_per_unit": 0.0, "reward_per_unit": 0.0, "rr": 0.0}
+    risk_per_unit = abs(entry - stop)
+    reward_per_unit = 0.0
+    if tp and tp > 0:
+        if str(side).lower() == "long":
+            reward_per_unit = max(0.0, tp - entry)
         else:
-            ref10 = (c[i] if close_only else h[i]); ref20 = (c[i] if close_only else h[i]); ref50 = (c[i] if close_only else h[i])
-            if ref10 > e10[i]: b10 += 1
-            if ref20 > e20[i]: b20 += 1
-            if strict50 and ref50 > e50[i]: b50 += 1
-    ok = (b10 <= allow10) and (b20 <= allow20) and (b50 == 0 if strict50 else True)
-    return ok, b10, b20, b50
+            reward_per_unit = max(0.0, entry - tp)
+    rr = (reward_per_unit / risk_per_unit) if risk_per_unit > 0 else 0.0
+    return {"risk_per_unit": float(risk_per_unit), "reward_per_unit": float(reward_per_unit), "rr": float(rr)}
 
-# =========================
-# Multi-pivot sök (med explosivt filter)
-# =========================
-
-def find_best_up_hit_segment(ohlcv, segment_start, include_turn_wick,
-                             use_segment_extreme,
-                             tol_886, tol_618, invalidate_on_new_low,
-                             max_bars, require_under_top_now,
-                             use_explosive=False, bursts_up=None, burst_lookback=20):
-    closes = [x[4] for x in ohlcv]; last_px = closes[-1] if closes else None
-    candidates = find_first_red_indices_in_segment(ohlcv, segment_start)
-    for r_idx in reversed(candidates):
-        if use_explosive and (not bursts_up or not has_burst_before(r_idx, bursts_up, burst_lookback)):
-            continue
-        setup = setup_up_from_index_segment(ohlcv, r_idx, segment_start,
-                                            include_turn_wick=include_turn_wick,
-                                            use_segment_extreme=use_segment_extreme)
-        if not setup: continue
-        seq = detect_up_0886_then_0618(ohlcv, setup, tol_886=tol_886, tol_618=tol_618,
-                                       invalidate_on_new_low=invalidate_on_new_low, max_bars=max_bars)
-        if not seq.get("ok"): continue
-        if require_under_top_now and (last_px is None or not (last_px < setup["top"])): continue
-        return setup, seq
-    return None, None
-
-def find_best_down_hit_segment(ohlcv, segment_start, include_turn_wick,
-                               use_segment_extreme,
-                               tol_886, tol_618, invalidate_on_new_high,
-                               max_bars, require_over_bottom_now,
-                               use_explosive=False, bursts_down=None, burst_lookback=20):
-    closes = [x[4] for x in ohlcv]; last_px = closes[-1] if closes else None
-    candidates = find_first_green_indices_in_segment(ohlcv, segment_start)
-    for g_idx in reversed(candidates):
-        if use_explosive and (not bursts_down or not has_burst_before(g_idx, bursts_down, burst_lookback)):
-            continue
-        setup = setup_down_from_index_segment(ohlcv, g_idx, segment_start,
-                                              include_turn_wick=include_turn_wick,
-                                              use_segment_extreme=use_segment_extreme)
-        if not setup: continue
-        seq = detect_down_0886_then_0618(ohlcv, setup, tol_886=tol_886, tol_618=tol_618,
-                                         invalidate_on_new_high=invalidate_on_new_high, max_bars=max_bars)
-        if not seq.get("ok"): continue
-        if require_over_bottom_now and (last_px is None or not (last_px > setup["bottom"])): continue
-        return setup, seq
-    return None, None
-
-# =========================
-# Streamlit UI
-# =========================
-
-st.set_page_config(page_title="0.886→0.618 Scanner (Bybit/Yahoo/Stooq/Avanza)", layout="wide")
-st.title("0.886 → 0.618 Scanner (Trend-segment + explosivt filter + EMA-surf)")
-
-with st.sidebar:
-    st.subheader("Inställningar")
-
-    data_source = st.selectbox(
-        "Datakälla",
-        [
-            "Bybit (USDT-perps, ccxt)",
-            "Yahoo Finance (aktier/ETF/cert)",
-            "Yahoo Finance (alla .ST, beta)",
-            "Avanza (CSV-upload)",
-            "Stooq (aktier/ETF, daglig)"
-        ],
-        index=0
-    )
-
-    # Flera timeframes
-    if data_source == "Bybit (USDT-perps, ccxt)":
-        timeframes = st.multiselect("Timeframes", ["1m","3m","5m","15m","30m","1h","2h","4h","6h","12h","1d"], default=["15m","1h","4h"])
-    elif data_source in ("Yahoo Finance (aktier/ETF/cert)", "Yahoo Finance (alla .ST, beta)", "Avanza (CSV-upload)"):
-        timeframes = st.multiselect("Timeframes (Yahoo/Avanza)", ["15m","30m","1h","1d"], default=["15m","1h"])
-    else:
-        timeframes = ["1d"]
-        st.info("Stooq stöder daglig data (1d).")
-
-    # Symboler
-    yf_symbols = []; stooq_symbols = []; ranked = []
-
-    if data_source == "Bybit (USDT-perps, ccxt)":
-        scan_all = st.checkbox("Skanna ALLA USDT-perps (ignorera vol-ranking)", value=True)
-        lookback_vol = st.number_input("Volatilitetsfönster (om vol-ranking används)", 50, 2000, 288, 10)
-        top_n = st.number_input("Om ej ALLA: antal mest volatila", 5, 200, 50, 5)
-
-    elif data_source == "Yahoo Finance (aktier/ETF/cert)":
-        st.caption("Yahoo-tickers separerade med kommatecken. Ex: VOLV-B.ST, HM-B.ST, XACT-BEAR.ST")
-        symbols_text = st.text_area("Tickers (Yahoo)", value="VOLV-B.ST, HM-B.ST", height=70)
-        yf_symbols = [s.strip() for s in symbols_text.split(",") if s.strip()]
-
-    elif data_source == "Yahoo Finance (alla .ST, beta)":
-        st.caption("Hämtar bred lista .ST (kan ta tid). Begränsa gärna antalet.")
-        if st.button("Hämta alla .ST"):
-            all_st = get_all_yahoo_st_tickers()
-            st.session_state["all_st"] = all_st
-            if all_st: st.success(f"Laddade {len(all_st)} tickers.")
-            else: st.warning("Hittade inga tickers.")
-        max_st = st.number_input("Max antal .ST (0 = alla)", 0, 10000, 500, 50)
-        prefilter = st.text_input("Prefixfilter (valfritt)", value="")
-        manual_fallback = st.text_area("Fallback (.ST separerade med kommatecken)", value="", height=70)
-        current_list = st.session_state.get("all_st", [])
-        if manual_fallback.strip():
-            current_list = [x.strip().upper() for x in manual_fallback.split(",") if x.strip()]
-        if prefilter:
-            current_list = [t for t in current_list if t.upper().startswith(prefilter.upper())]
-        if max_st and max_st > 0: current_list = current_list[:max_st]
-        if current_list: st.caption(f"Aktuell lista: {len(current_list)} tickers")
-        yf_symbols = current_list
-
-    elif data_source == "Avanza (CSV-upload)":
-        uploaded_file = st.file_uploader("Ladda upp Avanza CSV", type=["csv"])
-        if uploaded_file is not None:
-            try:
-                yf_symbols = load_avanza_csv(uploaded_file)
-                st.success(f"Hittade {len(yf_symbols)} tickers i CSV-filen.")
-            except Exception as e:
-                st.error(f"Kunde inte läsa CSV: {e}")
-        st.caption("Vi lägger på .ST om suffix saknas.")
-
-    else:
-        st.caption("Stooq är daglig data. Exempel: AAPL.US, MSFT.US")
-        symbols_text = st.text_area("Tickers (Stooq, daglig)", value="AAPL.US, MSFT.US", height=70)
-        stooq_symbols = [s.strip() for s in symbols_text.split(",") if s.strip()]
-
-    # Parallell-kontroller
-    st.markdown("— Körning —")
-    parallel = st.checkbox("Parallell skanning över TF", value=True)
-    max_workers = st.number_input("Max trådar (per TF)", 1, 8, 3, 1)
-
-    # Top/Bottom-källa
-    top_source = st.selectbox(
-        "Källa för Top/Bottom",
-        ["Lokalt block (precis före vändning)", "Högsta/lägsta i hela trendsegmentet"],
-        index=1
-    )
-    use_segment_extreme = (top_source == "Högsta/lägsta i hela trendsegmentet")
-
-    # Setup/sekvens-parametrar
-    top_lookback = st.number_input("Max bakåt för lokalt block (candles)", 5, 2000, 120, 5)
-    include_turn_wick = st.checkbox("Inkludera vändnings-wick i Top/Bottom", value=True)
-
-    tol_886 = st.number_input("Tolerans 0.886 (relativ)", 0.0, 0.02, 0.0006, 0.0001, format="%.4f")
-    tol_618 = st.number_input("Tolerans 0.618 (relativ)", 0.0, 0.02, 0.0008, 0.0001, format="%.4f")
-    max_bars = st.number_input("Max candles touch→retrace (0 = ingen gräns)", 0, 1000, 0, 1)
-
-    # Extraregler
-    invalidate_low  = st.checkbox("Upptrend: ogiltig vid ny lägre low innan 0.618", True)
-    invalidate_high = st.checkbox("Nedtrend: ogiltig vid ny högre high innan 0.618", True)
-    require_under_top_now   = st.checkbox("Krav: Last < Top (upptrend)", True)
-    require_over_bottom_now = st.checkbox("Krav: Last > Bottom (nedtrend)", True)
-
-    # Trend-läge
-    trend_mode = st.selectbox("Trendläge", ["Auto (EMA50/200)", "Upptrend", "Nedtrend"], index=0)
-    allow_range_scan = st.checkbox("Tillåt scanning i range (om ingen trend detekteras)", value=False)
-
-    # Explosivt filter + presets
-    st.markdown("— Explosivt filter —")
-    use_explosive = st.checkbox("Kräv explosiv rörelse före setup", value=True)
-    preset = st.selectbox(
-        "Preset för explosiv-filter",
-        ["Custom", "BTC/ETH högre TF (8–10% & 2.0–2.2)", "Alts intraday (4–6% & 1.6–1.8)"],
-        index=0
-    )
-    default_min_move = 6.0; default_atr_mult = 1.8
-    if preset == "BTC/ETH högre TF (8–10% & 2.0–2.2)":
-        default_min_move = 9.0; default_atr_mult = 2.1
-    elif preset == "Alts intraday (4–6% & 1.6–1.8)":
-        default_min_move = 5.0; default_atr_mult = 1.7
-    burst_win = st.number_input("Burst-fönster (bars)", 2, 12, 3, 1)
-    burst_min_move = st.number_input("Min % flytt (min_move_pct)", 1.0, 30.0, default_min_move, 0.5)
-    burst_atr_mult = st.number_input("ATR-multipel (atr_mult) vs ATR(14)", 0.5, 5.0, default_atr_mult, 0.1)
-    burst_vol_mult = st.number_input("Volym-multipel vs EMA(20)", 0.5, 6.0, 2.0, 0.1)
-    burst_lookback = st.number_input("Max bars pivot efter burst", 5, 150, 20, 1)
-    enforce_min_tf_15m = st.checkbox("Blockera explosivt filter under 15m", value=False)
-
-    # Formfilter / diagnostik
-    st.markdown("— Formfilter / diagnostik —")
-    show_diag = st.checkbox("Visa diagnostik/quality-kolumner", value=True)
-    min_quality = st.number_input("Min quality (0–100)", 0.0, 100.0, 50.0, 1.0)
-    min_span_atr = st.number_input("Min Span/ATR14", 0.0, 20.0, 1.2, 0.1)
-    min_adv_ratio_up = st.number_input("Min advance ratio (upptrend)", 0.0, 1.0, 0.60, 0.05)
-    min_adv_ratio_down = st.number_input("Min advance ratio (nedtrend)", 0.0, 1.0, 0.60, 0.05)
-    max_burst_to_pivot = st.number_input("Max bars: burst→pivot (0=ignorera)", 0, 500, 40, 1)
-
-    # EMA-surf-filter (NYTT)
-    st.markdown("— EMA-surf (10/20/50) —")
-    ema_surf_enable = st.checkbox("Kräv EMA-surf före och efter 0.886-touch", value=True)
-    ema_close_only = st.checkbox("Endast closes (tillåt wicks genom EMA)", value=True)
-    ema_allow10 = st.number_input("Max brott mot EMA10 (per hel sekvens)", 0, 50, 2, 1)
-    ema_allow20 = st.number_input("Max brott mot EMA20 (per hel sekvens)", 0, 50, 1, 1)
-    ema_strict50 = st.checkbox("Aldrig bryta EMA50 (strikt)", value=True)
-
-    # Datahämtning
-    limit_candles = st.number_input("Candles att hämta per symbol", 300, 3000, 800, 50)
-    run_btn = st.button("Skanna nu")
-
-status = st.empty()
-progress = st.progress(0, text="Väntar …")
-
-# =========================
-# Funktion som skannar EN timeframe (utan Streamlit-anrop)
-# =========================
-
-def scan_one_timeframe(data_source, tf, limit_candles, params):
-    hits = []
-    ranked = []
-    exchange = None
-
-    if data_source == "Bybit (USDT-perps, ccxt)":
-        exchange = ccxt.bybit({"enableRateLimit": True, "options": {"defaultType": "swap"}})
-        exchange.load_markets()
-        all_syms = load_usdt_perp_symbols(exchange) or []
-        if params["scan_all"]:
-            ranked = all_syms[:]
+# ====== HJÄLP ======
+def _ensure_numeric(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
+    for col in cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
         else:
-            vols = []
-            for s in all_syms:
+            df[col] = pd.NA
+    return df
+
+def timeframe_to_ms(tf: str) -> int:
+    return {"5m": 5*60*1000, "10m":10*60*1000, "15m":15*60*1000, "30m":30*60*1000, "60m":60*60*1000}[tf]
+
+# ====== HÄMTA PERPETUAL-TRADES ======
+def fetch_all_linear_trades(api_key: str, api_secret: str, start_time_ms: int | None, end_time_ms: int | None) -> List[Dict[str, Any]]:
+    trades: List[Dict[str, Any]] = []
+    cursor = None
+    safety_loops = 0
+    while True:
+        params: Dict[str, Any] = {"category": "linear", "limit": 200}
+        if cursor:
+            params["cursor"] = cursor
+        if start_time_ms:
+            params["startTime"] = start_time_ms
+        if end_time_ms:
+            params["endTime"] = end_time_ms
+
+        data = bybit_get("/v5/execution/list", params, api_key, api_secret)
+        if str(data.get("retCode")) != "0":
+            raise RuntimeError(f"Bybit API fel: {data.get('retCode')} - {data.get('retMsg')}")
+        result = data.get("result") or {}
+        rows = result.get("list") or []
+        trades.extend(rows)
+        cursor = result.get("nextPageCursor")
+        if not cursor:
+            break
+        safety_loops += 1
+        if safety_loops > 500:
+            break
+        time.sleep(0.15)
+    return trades
+
+# ====== KLINES (public) ======
+@st.cache_data(show_spinner=False, ttl=600)
+def fetch_klines_linear(symbol: str, interval: str, start_ms: int, end_ms: int) -> pd.DataFrame:
+    if interval not in {"1","3","5","15","30","60","120","240","360","720","D","W","M"}:
+        raise ValueError("Ogiltigt intervall för Bybit v5.")
+    out_rows: List[Dict[str, Any]] = []
+    cursor = None
+    safety = 0
+    while True:
+        params: Dict[str, Any] = {
+            "category": "linear",
+            "symbol": symbol,
+            "interval": interval,
+            "limit": 1000,
+            "start": start_ms,
+            "end": end_ms
+        }
+        if cursor:
+            params["cursor"] = cursor
+        data = bybit_get("/v5/market/kline", params)  # public
+        if str(data.get("retCode")) != "0":
+            break
+        result = data.get("result") or {}
+        for r in (result.get("list") or []):
+            out_rows.append({"ts": int(r[0]), "open": float(r[1]), "high": float(r[2]), "low": float(r[3]), "close": float(r[4])})
+        cursor = result.get("nextPageCursor")
+        if not cursor:
+            break
+        safety += 1
+        if safety > 100:
+            break
+        time.sleep(0.06)
+
+    if not out_rows:
+        return pd.DataFrame(columns=["ts","open","high","low","close"]).astype({"ts":"int64","open":"float","high":"float","low":"float","close":"float"})
+    df = pd.DataFrame(out_rows).drop_duplicates(subset=["ts"]).sort_values("ts").reset_index(drop=True)
+    return df
+
+def resample_5m_to_10m(df5: pd.DataFrame) -> pd.DataFrame:
+    if df5.empty:
+        return df5.copy()
+    df = df5.copy()
+    dt = pd.to_datetime(df["ts"], unit="ms", utc=True)
+    df = df.set_index(dt)
+    o = df["open"].resample("10T").first()
+    h = df["high"].resample("10T").max()
+    l = df["low"].resample("10T").min()
+    c = df["close"].resample("10T").last()
+    out = pd.DataFrame({"open":o,"high":h,"low":l,"close":c}).dropna().reset_index()
+    out["ts"] = (out["index"].astype("int64") // 10**6).astype("int64")
+    out = out.drop(columns=["index"])
+    out = out[["ts","open","high","low","close"]]
+    return out
+
+def compute_sma(series: pd.Series, period: int) -> pd.Series:
+    return series.rolling(window=period, min_periods=period).mean()
+
+def build_ma_df(symbol: str, timeframe_sel: str, ma_period: int, t_first_entry: int, t_last_event: int, post_extend_days: int) -> pd.DataFrame:
+    tf_map = {"5m":"5", "15m":"15", "30m":"30", "60m":"60"}
+    tf_ms = timeframe_to_ms(timeframe_sel)
+    warmup = ma_period * tf_ms * 3
+    t_start = max(0, int(t_first_entry) - warmup)
+    t_end = int(t_last_event) + int(post_extend_days) * 24 * 3600 * 1000
+
+    if timeframe_sel == "10m":
+        base = fetch_klines_linear(symbol, "5", t_start, t_end)
+        df = resample_5m_to_10m(base)
+    else:
+        bybit_tf = tf_map[timeframe_sel]
+        df = fetch_klines_linear(symbol, bybit_tf, t_start, t_end)
+
+    if df.empty:
+        return df
+
+    df = df.sort_values("ts").reset_index(drop=True)
+    df["ma"] = compute_sma(df["close"], ma_period)
+    return df
+
+# ====== VILLKOR (CLOSE-only) ======
+def first_stop_close_condition(ma_df: pd.DataFrame, t_entry: int, t_deadline: int, pos_side: str, tf: str) -> Tuple[bool, Optional[float], Optional[int]]:
+    if ma_df.empty:
+        return False, None, None
+    tf_ms = timeframe_to_ms(tf)
+    start_ts = t_entry + tf_ms
+    sub = ma_df[(ma_df["ts"] >= start_ts) & (ma_df["ts"] <= t_deadline)].dropna(subset=["ma"]).copy()
+    if sub.empty:
+        return False, None, None
+
+    if pos_side == "long":
+        hit = sub[sub["close"] < sub["ma"]]
+    else:
+        hit = sub[sub["close"] > sub["ma"]]
+
+    if not hit.empty:
+        row = hit.iloc[0]
+        return True, float(row["close"]), int(row["ts"])
+    return False, None, None
+
+def first_tp_after_original_close_condition(
+    ma_df: pd.DataFrame, t_entry: int, t_deadline: int, pos_side: str, tf: str, original_tp_price: float
+) -> Tuple[bool, Optional[float], Optional[int]]:
+    if ma_df.empty or not original_tp_price or original_tp_price <= 0:
+        return False, None, None
+
+    sub = ma_df[(ma_df["ts"] >= t_entry) & (ma_df["ts"] <= t_deadline)].dropna(subset=["ma"]).copy()
+    if sub.empty:
+        return False, None, None
+
+    if pos_side == "long":
+        passed = sub[sub["high"] >= float(original_tp_price)]
+        if passed.empty:
+            return False, None, None
+        p_ts = int(passed.iloc[0]["ts"])
+        sub2 = sub[sub["ts"] >= p_ts]
+        tp_hit = sub2[sub2["close"] < sub2["ma"]]
+    else:
+        passed = sub[sub["low"] <= float(original_tp_price)]
+        if passed.empty:
+            return False, None, None
+        p_ts = int(passed.iloc[0]["ts"])
+        sub2 = sub[sub["ts"] >= p_ts]
+        tp_hit = sub2[sub2["close"] > sub2["ma"]]
+
+    if not tp_hit.empty:
+        row = tp_hit.iloc[0]
+        return True, float(row["close"]), int(row["ts"])
+    return False, None, None
+
+# ====== PnL + EVENTS (ENTRY-notional ROI) ======
+def compute_linear_fifo_pnl_and_events(
+    trades_df: pd.DataFrame,
+    stop_enabled: bool = False,
+    stop_ma_period: int = 20,
+    stop_tf: str = "15m",
+    tp_enabled: bool = False,
+    tp_ma_period: int = 20,
+    tp_tf: str = "15m",
+    allow_after_original: bool = False,
+    post_extend_days: int = 14,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    if trades_df.empty:
+        summary = pd.DataFrame(columns=["symbol","realized_pnl_usdt","closed_notional_usdt","roi_pct"])
+        events = pd.DataFrame(columns=[
+            "ts","symbol","side_close","qty_closed","price_close",
+            "pnl_usdt","notional_usdt","r",
+            "stop_hit","tp_hit","after_original",
+            "exit_type","original_close_ts","original_close_price"
+        ])
+        return summary, events
+
+    df = trades_df.copy()
+    df = _ensure_numeric(df, ["execQty","execPrice","execValue","execFee","execTime"])
+    for c in ["symbol","side"]:
+        if c not in df.columns:
+            df[c] = None
+
+    if "execTime" in df.columns:
+        df = df.sort_values(by=["symbol","execTime"]).reset_index(drop=True)
+    else:
+        df = df.sort_values(by=["symbol"]).reset_index(drop=True)
+
+    summaries = []
+    event_rows = []
+
+    ma_cache: Dict[Tuple[str,str,int,int], pd.DataFrame] = {}
+
+    for symbol, g in df.groupby("symbol", sort=False):
+        longs: List[Dict[str, float]] = []
+        shorts: List[Dict[str, float]] = []
+        realized_pnl = 0.0
+        closed_notional = 0.0
+
+        t_min = int(pd.to_numeric(g["execTime"], errors="coerce").min())
+        t_max = int(pd.to_numeric(g["execTime"], errors="coerce").max())
+
+        def get_ma(symbol_: str, tf_: str, period_: int) -> pd.DataFrame:
+            key = (symbol_, tf_, period_, int(post_extend_days))
+            if key not in ma_cache:
                 try:
-                    ohlcv_tmp = fetch_ohlcv_safe(exchange, s, tf, limit=max(params["lookback_vol"], 300))
-                    vols.append((atr_like_vol(ohlcv_tmp, params["lookback_vol"]), s))
+                    ma_cache[key] = build_ma_df(symbol_, tf_, period_, t_min, t_max, post_extend_days)
                 except Exception:
-                    pass
-            vols.sort(reverse=True); ranked = [s for _, s in vols[:params["top_n"]]]
-    elif data_source in ("Yahoo Finance (aktier/ETF/cert)", "Yahoo Finance (alla .ST, beta)", "Avanza (CSV-upload)"):
-        ranked = params["yf_symbols"][:]
-    else:
-        ranked = params["stooq_symbols"][:]
+                    ma_cache[key] = pd.DataFrame()
+            return ma_cache[key]
 
-    for s in ranked:
-        try:
-            # OHLCV
-            if data_source == "Bybit (USDT-perps, ccxt)":
-                ohlcv = fetch_ohlcv_safe(exchange, s, tf, limit=limit_candles)
-            elif data_source in ("Yahoo Finance (aktier/ETF/cert)", "Yahoo Finance (alla .ST, beta)", "Avanza (CSV-upload)"):
-                ohlcv = fetch_ohlcv_yf(s, tf, limit=limit_candles)
-            else:
-                ohlcv = fetch_ohlcv_stooq(s, tf, limit=limit_candles)
-            if not ohlcv or len(ohlcv) < 210:
+        def deadline_ts(ma_df: pd.DataFrame, base_close_ts: int) -> int:
+            if allow_after_original and not ma_df.empty:
+                return int(ma_df["ts"].max())
+            return int(base_close_ts)
+
+        for _, row in g.iterrows():
+            side = str(row.get("side") or "")
+            qty  = float(row.get("execQty") or 0.0)
+            price = float(row.get("execPrice") or 0.0)
+            fee = float(row.get("execFee") or 0.0)
+            ts = int(row.get("execTime") or 0)
+
+            if qty <= 0 or price <= 0:
+                realized_pnl -= fee
                 continue
 
-            closes = [x[4] for x in ohlcv]; last_px = closes[-1]
-            side, seg_start = current_trend_and_segment_start(ohlcv)
+            if side.lower() == "buy":
+                qty_to_match = qty
+                fee_remaining = fee
+                while qty_to_match > 0 and shorts:
+                    lot = shorts[0]
+                    take = min(qty_to_match, lot["qty"])
 
-            if params["trend_mode"] == "Upptrend":
-                do_up, do_down = True, False
-            elif params["trend_mode"] == "Nedtrend":
-                do_up, do_down = False, True
+                    base_close_price = price
+                    base_close_ts = ts
+
+                    chosen_price = base_close_price
+                    chosen_ts = base_close_ts
+                    chosen_type = "ORIGINAL"
+                    stop_hit = False
+                    tp_hit = False
+                    after_original_flag = False
+
+                    d_stop = deadline_ts(get_ma(symbol, stop_tf, stop_ma_period) if stop_enabled else pd.DataFrame(), base_close_ts)
+                    d_tp   = deadline_ts(get_ma(symbol, tp_tf, tp_ma_period) if tp_enabled else pd.DataFrame(), base_close_ts)
+
+                    candidates: List[Tuple[str,int,float]] = []
+
+                    if stop_enabled:
+                        ma_stop_df = get_ma(symbol, stop_tf, stop_ma_period)
+                        hit, sp, st_ts = first_stop_close_condition(ma_stop_df, int(lot["ts"]), d_stop, "short", stop_tf)
+                        if hit:
+                            candidates.append(("STOP", int(st_ts), float(sp)))
+
+                    if tp_enabled:
+                        ma_tp_df = get_ma(symbol, tp_tf, tp_ma_period)
+                        hit, tpp, tpts = first_tp_after_original_close_condition(ma_tp_df, int(lot["ts"]), d_tp, "short", tp_tf, base_close_price)
+                        if hit:
+                            candidates.append(("TP", int(tpts), float(tpp)))
+
+                    if candidates:
+                        candidates.sort(key=lambda x: x[1])
+                        chosen_type, chosen_ts, chosen_price = candidates[0][0], int(candidates[0][1]), float(candidates[0][2])
+                        stop_hit = (chosen_type == "STOP")
+                        tp_hit = (chosen_type == "TP")
+                        after_original_flag = chosen_ts > base_close_ts
+
+                    entry_notional = lot["price"] * take
+                    pnl_core = (lot["price"] - chosen_price) * take
+
+                    fee_part = fee * (take / qty)
+                    pnl = pnl_core - fee_part
+                    realized_pnl += pnl
+                    fee_remaining -= fee_part
+
+                    closed_notional += entry_notional
+                    r = (pnl / entry_notional) if entry_notional > 0 else 0.0
+
+                    event_rows.append({
+                        "ts": int(chosen_ts), "symbol": symbol, "side_close": "Buy→close short",
+                        "qty_closed": take, "price_close": float(chosen_price),
+                        "pnl_usdt": pnl, "notional_usdt": entry_notional,
+                        "r": r,
+                        "stop_hit": stop_hit, "tp_hit": tp_hit, "after_original": after_original_flag,
+                        "exit_type": chosen_type,
+                        "original_close_ts": int(base_close_ts),
+                        "original_close_price": float(base_close_price)
+                    })
+
+                    lot["qty"] -= take
+                    qty_to_match -= take
+                    if lot["qty"] <= 1e-12:
+                        shorts.pop(0)
+
+                if qty_to_match > 0:
+                    realized_pnl -= fee_remaining
+                    longs.append({"qty": qty_to_match, "price": price, "ts": ts})
+
+            elif side.lower() == "sell":
+                qty_to_match = qty
+                fee_remaining = fee
+                while qty_to_match > 0 and longs:
+                    lot = longs[0]
+                    take = min(qty_to_match, lot["qty"])
+
+                    base_close_price = price
+                    base_close_ts = ts
+
+                    chosen_price = base_close_price
+                    chosen_ts = base_close_ts
+                    chosen_type = "ORIGINAL"
+                    stop_hit = False
+                    tp_hit = False
+                    after_original_flag = False
+
+                    d_stop = deadline_ts(get_ma(symbol, stop_tf, stop_ma_period) if stop_enabled else pd.DataFrame(), base_close_ts)
+                    d_tp   = deadline_ts(get_ma(symbol, tp_tf, tp_ma_period) if tp_enabled else pd.DataFrame(), base_close_ts)
+
+                    candidates: List[Tuple[str,int,float]] = []
+
+                    if stop_enabled:
+                        ma_stop_df = get_ma(symbol, stop_tf, stop_ma_period)
+                        hit, sp, st_ts = first_stop_close_condition(ma_stop_df, int(lot["ts"]), d_stop, "long", stop_tf)
+                        if hit:
+                            candidates.append(("STOP", int(st_ts), float(sp)))
+
+                    if tp_enabled:
+                        ma_tp_df = get_ma(symbol, tp_tf, tp_ma_period)
+                        hit, tpp, tpts = first_tp_after_original_close_condition(ma_tp_df, int(lot["ts"]), d_tp, "long", tp_tf, base_close_price)
+                        if hit:
+                            candidates.append(("TP", int(tpts), float(tpp)))
+
+                    if candidates:
+                        candidates.sort(key=lambda x: x[1])
+                        chosen_type, chosen_ts, chosen_price = candidates[0][0], int(candidates[0][1]), float(candidates[0][2])
+                        stop_hit = (chosen_type == "STOP")
+                        tp_hit = (chosen_type == "TP")
+                        after_original_flag = chosen_ts > base_close_ts
+
+                    entry_notional = lot["price"] * take
+                    pnl_core = (chosen_price - lot["price"]) * take
+
+                    fee_part = fee * (take / qty)
+                    pnl = pnl_core - fee_part
+                    realized_pnl += pnl
+                    fee_remaining -= fee_part
+
+                    closed_notional += entry_notional
+                    r = (pnl / entry_notional) if entry_notional > 0 else 0.0
+
+                    event_rows.append({
+                        "ts": int(chosen_ts), "symbol": symbol, "side_close": "Sell→close long",
+                        "qty_closed": take, "price_close": float(chosen_price),
+                        "pnl_usdt": pnl, "notional_usdt": entry_notional,
+                        "r": r,
+                        "stop_hit": stop_hit, "tp_hit": tp_hit, "after_original": after_original_flag,
+                        "exit_type": chosen_type,
+                        "original_close_ts": int(base_close_ts),
+                        "original_close_price": float(base_close_price)
+                    })
+
+                    lot["qty"] -= take
+                    qty_to_match -= take
+                    if lot["qty"] <= 1e-12:
+                        longs.pop(0)
+
+                if qty_to_match > 0:
+                    realized_pnl -= fee_remaining
+                    shorts.append({"qty": qty_to_match, "price": price, "ts": ts})
+
             else:
-                if side == 'up': do_up, do_down = True, False
-                elif side == 'down': do_up, do_down = False, True
-                else:
-                    if params["allow_range_scan"]:
-                        do_up, do_down = True, True; seg_start = max(0, len(ohlcv) - 300)
-                    else:
-                        do_up, do_down = False, False
+                realized_pnl -= fee
 
-            # Bursts
-            bursts_up, bursts_down = set(), set()
-            if params["use_explosive"]:
-                if params["enforce_min_tf_15m"] and tf in ("1m","3m","5m","10m"):
-                    bursts_up, bursts_down = set(), set()
-                else:
-                    bursts_up, bursts_down = detect_explosive_windows_dir(
-                        ohlcv, win=params["burst_win"], min_move_pct=params["burst_min_move"],
-                        atr_mult=params["burst_atr_mult"], vol_mult=params["burst_vol_mult"]
+        roi = (realized_pnl / closed_notional * 100.0) if closed_notional > 0 else 0.0
+        summaries.append({
+            "symbol": symbol,
+            "realized_pnl_usdt": round(realized_pnl, 6),
+            "closed_notional_usdt": round(closed_notional, 6),
+            "roi_pct": round(roi, 4),
+        })
+
+    summary_df = pd.DataFrame(summaries).sort_values(by="realized_pnl_usdt", ascending=False).reset_index(drop=True)
+    events_df = pd.DataFrame(event_rows)
+    if not events_df.empty:
+        events_df = events_df.sort_values(by="ts").reset_index(drop=True)
+    else:
+        events_df = pd.DataFrame(columns=[
+            "ts","symbol","side_close","qty_closed","price_close",
+            "pnl_usdt","notional_usdt","r",
+            "stop_hit","tp_hit","after_original",
+            "exit_type","original_close_ts","original_close_price"
+        ])
+    return summary_df, events_df
+
+# ====== WINRATE (med counts) ======
+def compute_winloss(events_df: pd.DataFrame) -> Tuple[int, int, int, float]:
+    if events_df is None or events_df.empty or "pnl_usdt" not in events_df.columns:
+        return 0, 0, 0, 0.0
+    e = events_df.copy()
+    e["pnl_usdt"] = pd.to_numeric(e["pnl_usdt"], errors="coerce")
+    e = e.dropna(subset=["pnl_usdt"])
+    e = e[e["pnl_usdt"] != 0]
+    if e.empty:
+        return 0, 0, 0, 0.0
+    wins = int((e["pnl_usdt"] > 0).sum())
+    losses = int((e["pnl_usdt"] < 0).sum())
+    total = wins + losses
+    winrate = (wins / total * 100.0) if total > 0 else 0.0
+    return wins, losses, total, winrate
+
+# ====== SIMULERING & KURVOR ======
+def simulate_equity_from_events(events_df: pd.DataFrame, start_equity: float, allocation_pct: float) -> Tuple[pd.DataFrame, float, float]:
+    if events_df.empty or start_equity <= 0 or allocation_pct <= 0:
+        curve = pd.DataFrame(columns=["ts","equity"])
+        return curve, start_equity, 0.0
+    eq = float(start_equity)
+    rows = []
+    for _, row in events_df.iterrows():
+        r = float(row.get("r") or 0.0)
+        eq = eq * (1.0 + allocation_pct * r)
+        rows.append({"ts": int(row.get("ts") or 0), "equity": eq})
+    curve = pd.DataFrame(rows)
+    total_ret = (eq / start_equity - 1.0) * 100.0
+    return curve, eq, total_ret
+
+def overlay_curves(base_curve: pd.DataFrame, sim_curve: pd.DataFrame) -> pd.DataFrame:
+    df1 = base_curve.rename(columns={"equity": "Original"})
+    df2 = sim_curve.rename(columns={"equity": "MA-Strategi"})
+    merged = pd.merge(df1, df2, on="ts", how="outer").sort_values("ts")
+    merged[["Original","MA-Strategi"]] = merged[["Original","MA-Strategi"]].ffill()
+    return merged.set_index("ts")
+
+# ====== PROJEKTION ======
+def estimate_daily_rate_from_curve(curve_df: pd.DataFrame) -> float:
+    if curve_df is None or curve_df.empty or len(curve_df) < 2:
+        return 0.0
+    ts0 = int(curve_df["ts"].iloc[0])
+    ts1 = int(curve_df["ts"].iloc[-1])
+    eq0 = float(curve_df["equity"].iloc[0])
+    eq1 = float(curve_df["equity"].iloc[-1])
+    if eq0 <= 0 or eq1 <= 0 or ts1 <= ts0:
+        return 0.0
+    days = (ts1 - ts0) / (24*3600*1000)
+    if days <= 0:
+        return 0.0
+    r_day = (eq1 / eq0) ** (1.0 / days) - 1.0
+    return r_day
+
+def project_equity(current_equity: float, daily_rate: float, horizon_days: int) -> float:
+    if current_equity <= 0:
+        return 0.0
+    return current_equity * ((1.0 + daily_rate) ** max(0, int(horizon_days)))
+
+# ====== OPTIMERING ======
+def _df_fingerprint(df: pd.DataFrame) -> str:
+    if df is None or df.empty:
+        return "empty"
+    tmin = pd.to_numeric(df.get("execTime", pd.Series([0])), errors="coerce").min()
+    tmax = pd.to_numeric(df.get("execTime", pd.Series([0])), errors="coerce").max()
+    nids = df.get("execId", pd.Series(dtype=str)).nunique() if "execId" in df.columns else len(df)
+    return f"{nids}_{int(tmin)}_{int(tmax)}"
+
+@st.cache_data(show_spinner=False, ttl=600)
+def run_combo(
+    df_fpr: str,
+    trades_df: pd.DataFrame,
+    stop_period: int, stop_tf: str,
+    tp_period: int, tp_tf: str,
+    allow_after_original: bool,
+    post_extend_days: int,
+    start_equity: float, alloc: float
+) -> Dict[str, Any]:
+    pnl_df, events_df = compute_linear_fifo_pnl_and_events(
+        trades_df,
+        stop_enabled=True, stop_ma_period=stop_period, stop_tf=stop_tf,
+        tp_enabled=True, tp_ma_period=tp_period, tp_tf=tp_tf,
+        allow_after_original=allow_after_original,
+        post_extend_days=post_extend_days
+    )
+    curve, final_eq, total_ret_pct = simulate_equity_from_events(events_df, start_equity, alloc)
+    total_realized = float(pnl_df["realized_pnl_usdt"].sum()) if not pnl_df.empty else 0.0
+    entry_notional = float(pnl_df["closed_notional_usdt"].sum()) if not pnl_df.empty else 0.0
+    avg_roi = (total_realized / entry_notional * 100.0) if entry_notional > 0 else 0.0
+    wins, losses, total, winrate_pct = compute_winloss(events_df)
+    return {
+        "final_eq": final_eq,
+        "total_ret_pct": total_ret_pct,
+        "total_realized": total_realized,
+        "avg_roi": avg_roi,
+        "winrate_pct": winrate_pct,
+        "wins": wins,
+        "losses": losses,
+        "total_trades": total,
+        "stop_period": stop_period, "stop_tf": stop_tf,
+        "tp_period": tp_period, "tp_tf": tp_tf,
+        "post_extend_days": post_extend_days
+    }
+
+def optimize_settings(
+    trades_df: pd.DataFrame,
+    start_equity: float,
+    allocation_pct: float,
+    allow_after_original: bool,
+    post_extend_days: int,
+    stop_periods: List[int],
+    stop_tfs: List[str],
+    tp_periods: List[int],
+    tp_tfs: List[str]
+) -> pd.DataFrame:
+    results = []
+    if trades_df is None or trades_df.empty or start_equity <= 0 or allocation_pct <= 0:
+        return pd.DataFrame(results)
+    total = len(stop_periods)*len(stop_tfs)*len(tp_periods)*len(tp_tfs)
+    prog = st.progress(0)
+    cnt = 0
+    fpr = _df_fingerprint(trades_df)
+    for sp in stop_periods:
+        for stf in stop_tfs:
+            for tp in tp_periods:
+                for ttf in tp_tfs:
+                    res = run_combo(
+                        fpr, trades_df, sp, stf, tp, ttf, allow_after_original, post_extend_days,
+                        start_equity, allocation_pct
                     )
+                    results.append(res)
+                    cnt += 1
+                    prog.progress(min(100, int(cnt/total*100)))
+    prog.empty()
+    return pd.DataFrame(results).sort_values("final_eq", ascending=False).reset_index(drop=True)
 
-            # === Upptrend ===
-            if do_up and seg_start is not None:
-                setup, seq = find_best_up_hit_segment(
-                    ohlcv, seg_start, params["include_turn_wick"],
-                    params["use_segment_extreme"],
-                    params["tol_886"], params["tol_618"], invalidate_on_new_low=params["invalidate_low"],
-                    max_bars=params["max_bars"], require_under_top_now=params["require_under_top_now"],
-                    use_explosive=params["use_explosive"], bursts_up=bursts_up, burst_lookback=params["burst_lookback"]
-                )
-                if setup and seq:
-                    fr = setup["freeze_idx"]; t_idx = seq["touch_idx"]; r_idx = seq["retrace_idx"]
-                    ema_ok=True; b10=b20=b50=0
-                    if params["ema_surf_enable"]:
-                        ok1, a10, a20, a50 = check_ema_surf(ohlcv, fr+1, t_idx, "up", params["ema_close_only"], params["ema_allow10"], params["ema_allow20"], params["ema_strict50"])
-                        ok2, b10_, b20_, b50_ = check_ema_surf(ohlcv, t_idx+1, r_idx, "up", params["ema_close_only"], params["ema_allow10"], params["ema_allow20"], params["ema_strict50"])
-                        ema_ok = ok1 and ok2
-                        b10=a10+b10_; b20=a20+b20_; b50=a50+b50_
-                    if ema_ok:
-                        tbar = ohlcv[t_idx]; rbar = ohlcv[r_idx]
-                        low_lvl = min(setup["level618"], setup["level886"]); hi_lvl = max(setup["level618"], setup["level886"])
-                        tv_url = build_tradingview_url(s) if data_source == "Bybit (USDT-perps, ccxt)" else None
-                        diag = compute_quality_and_debug(ohlcv, setup, seq, bursts_up, params["burst_win"], params["burst_lookback"], mode="up")
-                        reject = False
-                        if diag["Span/ATR14"] is not None and diag["Span/ATR14"] < params["min_span_atr"]: reject = True
-                        if not reject and params["max_burst_to_pivot"] and diag["Burst→Pivot bars"] is not None and diag["Burst→Pivot bars"] > params["max_burst_to_pivot"]: reject = True
-                        if not reject and diag["Advance ratio"] < params["min_adv_ratio_up"]: reject = True
-                        if not reject and diag["Quality"] < params["min_quality"]: reject = True
-                        if not reject:
-                            rec = {
-                                "Symbol": s, "TF": tf, "Trend": "Up",
-                                "Top": setup["top"], "Bottom": setup["bottom"],
-                                "0.886": setup["level886"], "0.618": setup["level618"],
-                                "Touch 0.886 (UTC)": ts(tbar[0]),
-                                "Retrace 0.618 (UTC)": ts(rbar[0]),
-                                "Bars touch→retrace": r_idx - t_idx,
-                                "Last": last_px,
-                                "Dist% till 0.886": pct_dist(last_px, setup["level886"]),
-                                "Dist% till 0.618": pct_dist(last_px, setup["level618"]),
-                                "Mellan 0.618–0.886 nu": bool(low_lvl <= last_px <= hi_lvl),
-                                "Under TOP nu": (last_px < setup["top"]),
-                                "Span/ATR14": diag["Span/ATR14"],
-                                "Advance ratio": diag["Advance ratio"],
-                                "Quality": diag["Quality"],
-                                "EMA surf OK": ema_ok,
-                                "Breach10": b10, "Breach20": b20, "Breach50": b50
-                            }
-                            if params["show_diag"]:
-                                rec["Burst→Pivot bars"] = diag["Burst→Pivot bars"]
-                                rec["Burst move %"] = diag["Burst move %"]
-                            if tv_url: rec = {"TradingView": tv_url, **rec}
-                            hits.append(rec)
+# ===== UI ======
+st.set_page_config(page_title="Bybit Perps – PnL, MA-Stop & MA-TP (Close-only) + Saldo & Position Size",
+                   page_icon="📊", layout="wide")
+st.title("📊 Bybit Perps – PnL, MA-Stop & MA-TP (Close-only)")
+st.caption("Jämför Original vs MA-strategi, se exit-markörer, optimera parametrar, projektera framåt, följ winrate – och beräkna positionsstorlek baserat på aktuell kontobalans.")
 
-            # === Nedtrend ===
-            if do_down and seg_start is not None:
-                setup, seq = find_best_down_hit_segment(
-                    ohlcv, seg_start, params["include_turn_wick"],
-                    params["use_segment_extreme"],
-                    params["tol_886"], params["tol_618"], invalidate_on_new_high=params["invalidate_high"],
-                    max_bars=params["max_bars"], require_over_bottom_now=params["require_over_bottom_now"],
-                    use_explosive=params["use_explosive"], bursts_down=bursts_down, burst_lookback=params["burst_lookback"]
-                )
-                if setup and seq:
-                    fr = setup["freeze_idx"]; t_idx = seq["touch_idx"]; r_idx = seq["retrace_idx"]
-                    ema_ok=True; b10=b20=b50=0
-                    if params["ema_surf_enable"]:
-                        ok1, a10, a20, a50 = check_ema_surf(ohlcv, fr+1, t_idx, "down", params["ema_close_only"], params["ema_allow10"], params["ema_allow20"], params["ema_strict50"])
-                        ok2, b10_, b20_, b50_ = check_ema_surf(ohlcv, t_idx+1, r_idx, "down", params["ema_close_only"], params["ema_allow10"], params["ema_allow20"], params["ema_strict50"])
-                        ema_ok = ok1 and ok2
-                        b10=a10+b10_; b20=a20+b20_; b50=a50+b50_
-                    if ema_ok:
-                        tbar = ohlcv[t_idx]; rbar = ohlcv[r_idx]
-                        low_lvl = min(setup["level618"], setup["level886"]); hi_lvl = max(setup["level618"], setup["level886"])
-                        tv_url = build_tradingview_url(s) if data_source == "Bybit (USDT-perps, ccxt)" else None
-                        diag = compute_quality_and_debug(ohlcv, setup, seq, bursts_down, params["burst_win"], params["burst_lookback"], mode="down")
-                        reject = False
-                        if diag["Span/ATR14"] is not None and diag["Span/ATR14"] < params["min_span_atr"]: reject = True
-                        if not reject and params["max_burst_to_pivot"] and diag["Burst→Pivot bars"] is not None and diag["Burst→Pivot bars"] > params["max_burst_to_pivot"]: reject = True
-                        if not reject and diag["Advance ratio"] < params["min_adv_ratio_down"]: reject = True
-                        if not reject and diag["Quality"] < params["min_quality"]: reject = True
-                        if not reject:
-                            rec = {
-                                "Symbol": s, "TF": tf, "Trend": "Down",
-                                "Top": setup["top"], "Bottom": setup["bottom"],
-                                "0.886": setup["level886"], "0.618": setup["level618"],
-                                "Touch 0.886 (UTC)": ts(tbar[0]),
-                                "Retrace 0.618 (UTC)": ts(rbar[0]),
-                                "Bars touch→retrace": r_idx - t_idx,
-                                "Last": last_px,
-                                "Dist% till 0.886": pct_dist(last_px, setup["level886"]),
-                                "Dist% till 0.618": pct_dist(last_px, setup["level618"]),
-                                "Mellan 0.618–0.886 nu": bool(low_lvl <= last_px <= hi_lvl),
-                                "Över BOTTOM nu": (last_px > setup["bottom"]),
-                                "Span/ATR14": diag["Span/ATR14"],
-                                "Advance ratio": diag["Advance ratio"],
-                                "Quality": diag["Quality"],
-                                "EMA surf OK": ema_ok,
-                                "Breach10": b10, "Breach20": b20, "Breach50": b50
-                            }
-                            if params["show_diag"]:
-                                rec["Burst→Pivot bars"] = diag["Burst→Pivot bars"]
-                                rec["Burst move %"] = diag["Burst move %"]
-                            if tv_url: rec = {"TradingView": tv_url, **rec}
-                            hits.append(rec)
-        except Exception:
-            # swallow symbol-level fel, fortsätt
-            pass
+with st.sidebar:
+    st.header("Konto")
+    acct_type = st.selectbox("Account type", ["UNIFIED", "CONTRACT"], index=0)
+    coin_sel = st.text_input("Valuta (t.ex. USDT)", value="USDT")
+    colb1, colb2 = st.columns(2)
+    with colb1:
+        show_balance_btn = st.button("Hämta saldo")
+    with colb2:
+        refresh_balance_btn = st.button("Uppdatera")
 
-    return hits
-
-# =========================
-# Körning
-# =========================
-
-if run_btn:
+if show_balance_btn or refresh_balance_btn:
     try:
-        status.write("Förbereder parametrar …")
-
-        params = {
-            "scan_all": scan_all if data_source == "Bybit (USDT-perps, ccxt)" else True,
-            "lookback_vol": locals().get("lookback_vol", 288),
-            "top_n": locals().get("top_n", 50),
-            "yf_symbols": locals().get("yf_symbols", []),
-            "stooq_symbols": locals().get("stooq_symbols", []),
-            "trend_mode": trend_mode,
-            "allow_range_scan": allow_range_scan,
-            "include_turn_wick": include_turn_wick,
-            "use_segment_extreme": use_segment_extreme,
-            "tol_886": tol_886, "tol_618": tol_618, "max_bars": max_bars,
-            "invalidate_low": invalidate_low, "invalidate_high": invalidate_high,
-            "require_under_top_now": require_under_top_now, "require_over_bottom_now": require_over_bottom_now,
-            "use_explosive": use_explosive, "burst_win": burst_win, "burst_min_move": burst_min_move,
-            "burst_atr_mult": burst_atr_mult, "burst_vol_mult": burst_vol_mult, "burst_lookback": burst_lookback,
-            "enforce_min_tf_15m": enforce_min_tf_15m,
-            "show_diag": show_diag, "min_quality": min_quality, "min_span_atr": min_span_atr,
-            "min_adv_ratio_up": min_adv_ratio_up, "min_adv_ratio_down": min_adv_ratio_down,
-            "max_burst_to_pivot": max_burst_to_pivot,
-            "ema_surf_enable": ema_surf_enable, "ema_close_only": ema_close_only,
-            "ema_allow10": ema_allow10, "ema_allow20": ema_allow20, "ema_strict50": ema_strict50,
-        }
-
-        all_hits = []
-        completed = 0
-        total = max(1, len(timeframes))
-
-        if parallel and len(timeframes) > 1:
-            # Begränsa trådar; om Bybit används, var extra snäll
-            workers = min(max_workers, len(timeframes))
-            if data_source == "Bybit (USDT-perps, ccxt)":
-                workers = min(workers, 2)  # var försiktig med rate limits
-            status.write(f"Kör parallellt över {len(timeframes)} TF (workers={workers}) …")
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                futs = {pool.submit(scan_one_timeframe, data_source, tf, limit_candles, params): tf for tf in timeframes}
-                for fut in as_completed(futs):
-                    tf = futs[fut]
-                    try:
-                        hits = fut.result()
-                        all_hits.extend(hits)
-                    except Exception as e:
-                        st.warning(f"{tf} misslyckades: {e}")
-                    completed += 1
-                    progress.progress(int(completed/total*100), text=f"Klar med {completed}/{total} TF")
-        else:
-            status.write(f"Kör sekventiellt över {len(timeframes)} TF …")
-            for tf in timeframes:
-                hits = scan_one_timeframe(data_source, tf, limit_candles, params)
-                all_hits.extend(hits)
-                completed += 1
-                progress.progress(int(completed/total*100), text=f"Klar med {completed}/{total} TF")
-
-        # Resultat
-        if all_hits:
-            df = pd.DataFrame(all_hits)
-            float_cols = ["Top","Bottom","0.886","0.618","Last","Dist% till 0.886","Dist% till 0.618",
-                          "Burst move %","Span/ATR14","Advance ratio","Quality"]
-            for col in float_cols:
-                if col in df.columns:
-                    if col in ("Burst move %","Span/ATR14","Advance ratio","Quality"):
-                        df[col] = df[col].map(lambda x: None if x is None else float(x))
-                    else:
-                        df[col] = df[col].map(lambda x: None if x is None else float(f"{x:.6f}"))
-            sort_cols = [c for c in ["EMA surf OK","Quality","Mellan 0.618–0.886 nu","Dist% till 0.886"] if c in df.columns]
-            if sort_cols:
-                df = df.sort_values(by=sort_cols, ascending=[False, False, False, True], kind="mergesort")
-            preferred_order = ["TradingView","Symbol","TF","Trend","Top","Bottom","0.886","0.618",
-                               "Touch 0.886 (UTC)","Retrace 0.618 (UTC)","Bars touch→retrace",
-                               "Last","Dist% till 0.886","Dist% till 0.618",
-                               "EMA surf OK","Breach10","Breach20","Breach50",
-                               "Span/ATR14","Advance ratio","Quality","Burst move %","Burst→Pivot bars",
-                               "Mellan 0.618–0.886 nu","Under TOP nu","Över BOTTOM nu"]
-            cols = [c for c in preferred_order if c in df.columns] + [c for c in df.columns if c not in preferred_order]
-            df = df[cols]
-            st.success(f"Klar. Träffar totalt över {len(timeframes)} TF: {len(df)}")
-            col_config = {}
-            if "TradingView" in df.columns:
-                col_config["TradingView"] = st.column_config.LinkColumn("TV", help="Öppna i TradingView (BYBIT perps)", display_text="📈")
-            st.data_editor(df, hide_index=True, use_container_width=True, column_config=col_config, disabled=True)
-        else:
-            st.info("Inga symboler uppfyllde villkoren i valda timeframes.")
+        st.session_state['acct_balance'] = fetch_wallet_balance(API_KEY, API_SECRET, acct_type, coin_sel or None)
+        st.toast("Saldo uppdaterat.", icon="✅")
     except Exception as e:
-        st.error(f"Fel: {e}")
+        st.error(f"Kunde inte hämta saldo: {e}")
+
+bal = st.session_state.get('acct_balance')
+if isinstance(bal, dict) and bal and 'coin' in bal:
+    st.subheader("Kontosaldo")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Equity", f"{bal['equity']:,.2f} {bal['coin']}")
+    c2.metric("Wallet", f"{bal['walletBalance']:,.2f} {bal['coin']}")
+    c3.metric("Available", f"{bal['available']:,.2f} {bal['coin']}")
+    c4.metric("Unrealised PnL", f"{bal['unrealisedPnl']:,.2f} {bal['coin']}")
+    st.caption(f"Konto: {bal.get('accountType','?')}")
+else:
+    st.info("Hämta kontosaldo för att använda positionsräknaren.")
+
+with st.sidebar:
+    st.header("Tidsintervall (trades)")
+    c1, c2 = st.columns(2)
+    with c1:
+        days_back_from = st.number_input("Från (dagar bakåt)", min_value=0, max_value=3650, value=0, step=1)
+    with c2:
+        days_back_to = st.number_input("Till (dagar bakåt)", min_value=0, max_value=3650, value=0, step=1)
+    st.caption("Lämna båda 0 för att hämta allt som API:t returnerar.")
+
+    st.header("Kapital & Allokering (sim-kurvor)")
+    start_equity = st.number_input("Startkapital i USDT", min_value=0.0, value=0.0, step=100.0)
+    allocation_pct_input = st.number_input("Allokering per event (%)", min_value=0.0, max_value=100.0, value=100.0, step=5.0)
+
+    st.header("MA-Stop (CLOSE)")
+    use_ma_stop = st.checkbox("Aktivera MA-Stop", value=True)
+    stop_ma_period = st.selectbox("MA-period (Stop)", [10, 20, 50], index=1)
+    stop_tf = st.selectbox("Timeframe (Stop)", ["5m","10m","15m","30m","60m"], index=2)
+
+    st.header("MA-TP (CLOSE)")
+    use_ma_tp = st.checkbox("Aktivera MA-TP (kräver passage av original-TP)", value=True)
+    tp_ma_period = st.selectbox("MA-period (TP)", [10, 20, 50], index=1)
+    tp_tf = st.selectbox("Timeframe (TP)", ["5m","10m","15m","30m","60m"], index=2)
+
+    st.header("Prioritering & sökfönster")
+    allow_after = st.toggle("Tillåt exit efter original (håll längre)", value=st.session_state["allow_after_default"])
+    st.session_state["allow_after_default"] = allow_after
+    post_extend_days = st.number_input("Sökfönster efter original-TP (dagar)", min_value=1, max_value=90, value=30, step=1,
+                                       help="Hur länge vi fortsätter leta efter MA-TP/STOP efter historisk TP-passering/sista event.")
+
+    fetch_btn = st.button("Hämta & simulera trades")
+
+# ===== Position Size-räknare (i huvudvyn, under saldot) =====
+st.divider()
+st.markdown("## Position size & Risk (live mot kontosaldo)")
+
+def _to_float(s: str) -> float:
+    if s is None:
+        return 0.0
+    s = str(s).strip().replace(" ", "").replace(",", ".")
+    import re
+    m = re.search(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", s)
+    try:
+        return float(m.group(0)) if m else 0.0
+    except Exception:
+        return 0.0
+
+for k in ["entry_price_str","stop_price_str","tp_price_str"]:
+    st.session_state.setdefault(k, "")
+
+def _bulk_paste_cb():
+    raw = st.session_state.get("bulk_paste_raw","") or ""
+    tpl = raw.replace(";", " ").replace("/", " ").replace("|", " ").replace("\t", " ")
+    tpl = tpl.replace(",", ".")
+    import re
+    nums = re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", tpl)
+    if len(nums) >= 2:
+        st.session_state["entry_price_str"] = nums[0]
+        st.session_state["stop_price_str"]  = nums[1]
+        if len(nums) >= 3:
+            st.session_state["tp_price_str"] = nums[2]
+        st.toast("Klistrade in entry/stop/TP.", icon="✅")
+
+if isinstance(st.session_state.get('acct_balance'), dict) and st.session_state['acct_balance'] and 'coin' in st.session_state['acct_balance']:
+    bal = st.session_state['acct_balance']
+    side = st.radio("Riktning", ["long", "short"], horizontal=True, index=0)
+
+    st.text_input(
+        "Snabbklistra (entry stop [tp]) – t.ex. 0.3726 0.3510 0.4180",
+        key="bulk_paste_raw",
+        on_change=_bulk_paste_cb,
+        placeholder="0.3726 0.3510 0.4180"
+    )
+
+    e1, e2, e3, e4 = st.columns(4)
+    with e1:
+        st.text_input("Entry", key="entry_price_str", placeholder="t.ex. 0.3726")
+    with e2:
+        st.text_input("Stop", key="stop_price_str", placeholder="t.ex. 0.3510")
+    with e3:
+        st.text_input("Take Profit (valfritt)", key="tp_price_str", placeholder="t.ex. 0.4180")
+    with e4:
+        leverage = st.number_input("Leverage (kontroll)", min_value=1.0, max_value=100.0, value=5.0, step=1.0)
+
+    entry_price = _to_float(st.session_state.get("entry_price_str",""))
+    stop_price  = _to_float(st.session_state.get("stop_price_str",""))
+    tp_price    = _to_float(st.session_state.get("tp_price_str",""))
+
+    r1, r2 = st.columns(2)
+    with r1:
+        risk_pct = st.number_input("Risk av konto (%)", min_value=0.01, max_value=100.0, value=1.0, step=0.25)
+    with r2:
+        fee_buf = st.number_input("Buffert avgifter/slippage (%)", min_value=0.0, max_value=1.0, value=0.10, step=0.05,
+                                  help="Dras från riskbeloppet för att undvika överskjutande förlust vid stop.")
+
+    if entry_price > 0 and stop_price > 0 and risk_pct > 0:
+        ps = calc_position_size(side, entry_price, stop_price, bal['equity'], risk_pct, fee_buf, leverage, available=bal['available'])
+        rr = calc_rr(side, entry_price, stop_price, tp_price if tp_price > 0 else None)
+
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Riskbelopp", f"{ps['risk_amount_usdt']:,.2f} USDT")
+        k2.metric("Kontraktsmängd (qty)", f"{ps['qty']:,.6f}")
+        k3.metric("Notional", f"{ps['notional']:,.2f} USDT")
+        k4.metric("Init. marginal", f"{ps['init_margin']:,.2f} USDT")
+
+        j1, j2, j3 = st.columns(3)
+        j1.metric("Risk/kontrakt", f"{rr['risk_per_unit']:,.6f} $")
+        j2.metric("Reward/kontrakt", f"{rr['reward_per_unit']:,.6f} $")
+        j3.metric("R:R", f"{rr['rr']:,.2f} R")
+
+        if ps["capped"] > 0:
+            st.warning("Storleken har kapats till tillgänglig marginal × leverage. Minska risk% eller höj leverage/tillgängligt saldo.")
+    else:
+        st.info("Klistra in eller skriv entry, stop och risk% och tryck Enter.")
+else:
+    st.info("Hämta saldo för att aktivera positionsräknaren.")
+
+# ===== HÄMTA TRADES =====
+if fetch_btn:
+    start_ms = None
+    end_ms = None
+    now_ms = int(time.time() * 1000)
+    if days_back_from > 0:
+        start_ms = now_ms - int(days_back_from * 24 * 3600 * 1000)
+    if days_back_to > 0:
+        end_ms = now_ms - int(days_back_to * 24 * 3600 * 1000)
+        if start_ms and end_ms and start_ms > end_ms:
+            start_ms, end_ms = end_ms, start_ms
+    with st.spinner("Hämtar Bybit-perpetuals…"):
+        try:
+            raw_trades = fetch_all_linear_trades(API_KEY, API_SECRET, start_ms, end_ms)
+        except Exception as e:
+            st.error(f"Kunde inte hämta trades: {e}")
+            st.stop()
+    if not raw_trades:
+        st.info("Inga trades hittades för valt intervall.")
+        st.stop()
+    st.session_state["trades_df"] = pd.DataFrame(raw_trades)
+    st.session_state["opt_results"] = None
+
+# ===== HUVUDVY – TRADES =====
+df = st.session_state.get("trades_df")
+if df is None:
+    st.info("Klicka ”Hämta & simulera trades” för att läsa in dina trades.")
+    st.stop()
+
+nice_cols = ["symbol","side","execQty","execPrice","execValue","execFee","feeCurrency","orderId","execId","execType","isMaker","execTime"]
+view_cols = [c for c in nice_cols if c in df.columns]
+
+st.subheader("Alla PERP-trades (USDT-linear)")
+st.dataframe(df[view_cols] if view_cols else df, use_container_width=True, height=420)
+
+# ===== Original (bas) =====
+base_pnl_df, base_events_df = compute_linear_fifo_pnl_and_events(
+    df,
+    stop_enabled=False,
+    tp_enabled=False,
+    allow_after_original=False,
+    post_extend_days=post_extend_days
+)
+base_total_realized = float(base_pnl_df["realized_pnl_usdt"].sum()) if not base_pnl_df.empty else 0.0
+base_entry_notional = float(base_pnl_df["closed_notional_usdt"].sum()) if not base_pnl_df.empty else 0.0
+base_avg_roi = (base_total_realized / base_entry_notional * 100.0) if base_entry_notional > 0 else 0.0
+base_w, base_l, base_n, base_winrate = compute_winloss(base_events_df)
+
+# ===== MA-strategi (aktuella val) =====
+if not use_ma_stop and not use_ma_tp:
+    st.info("Aktivera minst en av MA-Stop eller MA-TP för jämförelse.")
+    st.stop()
+
+sim_pnl_df, sim_events_df = compute_linear_fifo_pnl_and_events(
+    df,
+    stop_enabled=use_ma_stop,
+    stop_ma_period=int(stop_ma_period),
+    stop_tf=str(stop_tf),
+    tp_enabled=use_ma_tp,
+    tp_ma_period=int(tp_ma_period),
+    tp_tf=str(tp_tf),
+    allow_after_original=bool(allow_after),
+    post_extend_days=int(post_extend_days),
+)
+sim_total_realized = float(sim_pnl_df["realized_pnl_usdt"].sum()) if not sim_pnl_df.empty else 0.0
+sim_entry_notional = float(sim_pnl_df["closed_notional_usdt"].sum()) if not sim_pnl_df.empty else 0.0
+sim_avg_roi = (sim_total_realized / sim_entry_notional * 100.0) if sim_entry_notional > 0 else 0.0
+sim_w, sim_l, sim_n, sim_winrate  = compute_winloss(sim_events_df)
+
+# ===== Jämförelse – sida vid sida =====
+st.markdown("## Jämförelse: Original vs MA-strategi")
+colL, colR = st.columns(2)
+
+with colL:
+    st.markdown("### Original (historiskt)")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Realiserad PnL (USDT)", f"{base_total_realized:,.2f}")
+    c2.metric("Genomsnittlig ROI", f"{base_avg_roi:,.2f}%")
+    if start_equity > 0:
+        c3.metric("Kontoutv. från start", f"{(base_total_realized/start_equity*100):,.2f}%")
+    wc1, wc2 = st.columns(2)
+    wc1.metric(f"Winrate ({base_w}W / {base_l}L)", f"{base_winrate:,.2f}%")
+    st.caption(f"Totalt räknade events: {base_n}")
+    st.dataframe(base_pnl_df, use_container_width=True, height=280)
+
+with colR:
+    st.markdown("### MA-strategi (aktuella val)")
+    d1, d2, d3 = st.columns(3)
+    d1.metric("Realiserad PnL (USDT)", f"{sim_total_realized:,.2f}", delta=f"{(sim_total_realized-base_total_realized):,.2f}")
+    d2.metric("Genomsnittlig ROI", f"{sim_avg_roi:,.2f}%", delta=f"{(sim_avg_roi-base_avg_roi):,.2f}%")
+    if start_equity > 0:
+        d3.metric("Kontoutv. från start", f"{(sim_total_realized/start_equity*100):,.2f}%",
+                  delta=f"{((sim_total_realized-base_total_realized)/start_equity*100):,.2f}%")
+    wd1, wd2 = st.columns(2)
+    wd1.metric(f"Winrate ({sim_w}W / {sim_l}L)", f"{sim_winrate:,.2f}%", delta=f"{(sim_winrate-base_winrate):,.2f}%")
+    st.caption(f"Totalt räknade events: {sim_n}")
+    st.dataframe(sim_pnl_df, use_container_width=True, height=280)
+
+# ===== Kontokurvor – överlagrad =====
+st.markdown("### Kontokurva – överlagrad")
+alloc = float(allocation_pct_input) / 100.0 if start_equity > 0 else 0.0
+if start_equity > 0 and alloc > 0:
+    base_curve, base_final_eq, base_total_ret = simulate_equity_from_events(base_events_df, start_equity, alloc)
+    sim_curve, sim_final_eq, sim_total_ret = simulate_equity_from_events(sim_events_df, start_equity, alloc)
+    over = overlay_curves(base_curve, sim_curve)
+    st.line_chart(over, height=280, use_container_width=True)
+    e1, e2, e3, e4 = st.columns(4)
+    e1.metric("Slutligt konto – Original", f"{base_final_eq:,.2f} USDT")
+    e2.metric("Total avkastning – Original", f"{base_total_ret:,.2f}%")
+    e3.metric("Slutligt konto – MA", f"{sim_final_eq:,.2f} USDT", delta=f"{(sim_final_eq-base_final_eq):,.2f}")
+    e4.metric("Total avkastning – MA", f"{sim_total_ret:,.2f}%", delta=f"{(sim_total_ret-base_total_ret):,.2f}%")
+else:
+    st.info("Ange startkapital och allokering > 0% för att se kontokurvor.")
+    base_curve, sim_curve = pd.DataFrame(), pd.DataFrame()
+
+# ===== Winrate per symbol =====
+st.markdown("### Winrate per symbol (MA-strategi)")
+if not sim_events_df.empty:
+    tmp = sim_events_df.copy()
+    tmp["pnl_usdt"] = pd.to_numeric(tmp["pnl_usdt"], errors="coerce")
+    tmp = tmp.dropna(subset=["pnl_usdt"])
+    tmp = tmp[tmp["pnl_usdt"] != 0]
+    if not tmp.empty:
+        g = tmp.groupby("symbol")["pnl_usdt"]
+        per_symbol = pd.DataFrame({
+            "wins":  g.apply(lambda s: int((s > 0).sum())),
+            "losses":g.apply(lambda s: int((s < 0).sum()))
+        })
+        per_symbol["total"] = per_symbol["wins"] + per_symbol["losses"]
+        per_symbol["winrate_pct"] = per_symbol.apply(
+            lambda r: (r["wins"]/r["total"]*100.0) if r["total"]>0 else 0.0, axis=1
+        )
+        per_symbol = per_symbol.sort_values(["winrate_pct","total"], ascending=[False, False]).reset_index()
+        st.dataframe(per_symbol, use_container_width=True, height=260)
+    else:
+        st.info("Inga icke-noll PnL-events för att beräkna per-symbol-winrate.")
+else:
+    st.info("Inga händelser i simuleringen för att beräkna per-symbol-winrate.")
+
+# ===== Händelser – etiketter =====
+st.markdown("### Händelser (senaste 100) – med exit_type och jämförelse mot original")
+if not sim_events_df.empty:
+    show_cols = ["ts","symbol","side_close","qty_closed","price_close",
+                 "pnl_usdt","r","exit_type","after_original",
+                 "original_close_price","original_close_ts","stop_hit","tp_hit"]
+    st.dataframe(sim_events_df[show_cols].tail(100), use_container_width=True, height=360)
+else:
+    st.info("Inga händelser i simuleringen.")
+
+# ===== Exit-markörer (TP/STOP) – tabell + nedladdning + chart =====
+st.divider()
+st.markdown("## Exit-markörer (simulerade)")
+
+def build_markers_df(events: pd.DataFrame) -> pd.DataFrame:
+    if events.empty:
+        return pd.DataFrame(columns=["symbol","event","ts","time_utc","price","pnl_usdt","r","after_original","side_close"])
+    m = events[events["exit_type"].isin(["STOP","TP"])].copy()
+    if m.empty:
+        return pd.DataFrame(columns=["symbol","event","ts","time_utc","price","pnl_usdt","r","after_original","side_close"])
+    m["event"] = np.where(m["exit_type"]=="STOP","MA_STOP","MA_TP")
+    m["time_utc"] = pd.to_datetime(m["ts"], unit="ms", utc=True)
+    m.rename(columns={"price_close":"price"}, inplace=True)
+    cols = ["symbol","event","ts","time_utc","price","pnl_usdt","r","after_original","side_close"]
+    cols = [c for c in cols if c in m.columns]
+    return m[cols].sort_values(["symbol","ts"]).reset_index(drop=True)
+
+markers_df = build_markers_df(sim_events_df)
+if markers_df.empty:
+    st.info("Inga simulerade MA-TP/STOP att visa för nuvarande inställningar.")
+else:
+    all_syms = list(markers_df["symbol"].unique())
+    sel_syms = st.multiselect("Välj symbol(er) att visa", all_syms, default=all_syms)
+    view_markers = markers_df[markers_df["symbol"].isin(sel_syms)].copy()
+    st.dataframe(view_markers, use_container_width=True, height=280)
+
+    csv = view_markers.to_csv(index=False).encode("utf-8")
+    st.download_button("📥 Ladda ner markörer (CSV)", data=csv, file_name="ma_exit_markers.csv", mime="text/csv")
+
+    st.markdown("### Chart-preview med markörer")
+    c1, c2 = st.columns(2)
+    with c1:
+        chart_symbol = st.selectbox("Symbol för chart", all_syms)
+    with c2:
+        chart_tf = st.selectbox("Timeframe för chart", ["5m","10m","15m","30m","60m"], index=2,
+                                help="Visningstimeframe (separat från reglernas TF).")
+    subm = markers_df[markers_df["symbol"] == chart_symbol]
+    tmin = int(subm["ts"].min())
+    tmax = int(subm["ts"].max())
+    pad = timeframe_to_ms(chart_tf) * 200
+    start_ms = max(0, tmin - pad)
+    end_ms = tmax + pad
+
+    if chart_tf == "10m":
+        base = fetch_klines_linear(chart_symbol, "5", start_ms, end_ms)
+        kdf = resample_5m_to_10m(base)
+    else:
+        tf_map = {"5m":"5","15m":"15","30m":"30","60m":"60"}
+        kdf = fetch_klines_linear(chart_symbol, tf_map[chart_tf], start_ms, end_ms)
+
+    if kdf.empty:
+        st.info("Kunde inte hämta klines för vald symbol/tidsfönster.")
+    else:
+        kdf["time_utc"] = pd.to_datetime(kdf["ts"], unit="ms", utc=True)
+        if not PLOTLY_AVAILABLE:
+            st.warning("Plotly saknas i miljön. Installera med `pip install plotly` för candlestick + markörer.")
+            line_df = kdf[["time_utc","close"]].set_index("time_utc")
+            st.line_chart(line_df, use_container_width=True, height=280)
+            st.caption("Fallback-graf (endast close). Markörer finns i tabellen ovan och kan laddas ner som CSV.")
+        else:
+            fig = go.Figure(data=[go.Candlestick(
+                x=kdf["time_utc"],
+                open=kdf["open"], high=kdf["high"],
+                low=kdf["low"], close=kdf["close"],
+                name="Price"
+            )])
+            subs = subm.copy()
+            subs["time_utc"] = pd.to_datetime(subs["ts"], unit="ms", utc=True)
+            stops = subs[subs["event"] == "MA_STOP"]
+            if not stops.empty:
+                fig.add_trace(go.Scatter(
+                    x=stops["time_utc"], y=stops["price"],
+                    mode="markers+text",
+                    text=["STOP"]*len(stops),
+                    textposition="top center",
+                    name="MA_STOP",
+                    marker=dict(symbol="x", size=10)
+                ))
+            tps = subs[subs["event"] == "MA_TP"]
+            if not tps.empty:
+                fig.add_trace(go.Scatter(
+                    x=tps["time_utc"], y=tps["price"],
+                    mode="markers+text",
+                    text=["TP"]*len(tps),
+                    textposition="bottom center",
+                    name="MA_TP",
+                    marker=dict(symbol="triangle-up", size=10)
+                ))
+            fig.update_layout(height=520, xaxis_title="Tid (UTC)", yaxis_title="Pris", legend=dict(orientation="h"))
+            st.plotly_chart(fig, use_container_width=True)
+
+# ===== Framåtriktad projektion =====
+st.divider()
+st.markdown("## Framåtriktad projektion (daglig CAGR)")
+if start_equity > 0 and alloc > 0 and (not base_curve.empty or not sim_curve.empty):
+    proj_source = st.radio("Vilken kurva vill du projicera från?", ["MA-Strategi", "Original"], index=0, horizontal=True)
+    horizon_days = st.number_input("Antal dagar framåt (t.ex. 30, 100, 365)", min_value=1, max_value=2000, value=30, step=1)
+
+    src_curve = sim_curve if proj_source == "MA-Strategi" else base_curve
+    if src_curve.empty or len(src_curve) < 2:
+        st.warning("För få datapunkter på vald kurva för att estimera daglig avkastning.")
+    else:
+        current_eq = float(src_curve["equity"].iloc[-1])
+        daily_rate = estimate_daily_rate_from_curve(src_curve)
+
+        span_days = (int(src_curve["ts"].iloc[-1]) - int(src_curve["ts"].iloc[0])) / (24*3600*1000)
+        if span_days < 7:
+            st.info("Obs: Historiken är kort (<7 dagar). Daglig avkastning kan vara instabil.")
+
+        projected_eq = project_equity(current_eq, daily_rate, int(horizon_days))
+        exp_change_pct = (projected_eq / current_eq - 1.0) * 100.0
+        exp_profit = projected_eq - current_eq
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Antagen daglig avkastning", f"{daily_rate*100:,.3f}%")
+        c2.metric(f"Förväntad förändring ({horizon_days} dgr)", f"{exp_change_pct:,.2f}%")
+        c3.metric("Nuvarande konto (från kurvan)", f"{current_eq:,.2f} USDT")
+        c4.metric(f"Prognostiserat konto (+{horizon_days} dgr)", f"{projected_eq:,.2f} USDT", delta=f"{exp_profit:,.2f} USDT")
+else:
+    st.info("Ange startkapital och allokering > 0%, och kör en simulering för att göra projektion.")
+
+# ===== Auto-optimering =====
+st.divider()
+st.markdown("## Auto-optimering (grid search)")
+
+with st.expander("Visa inställningar för optimering", expanded=st.session_state["opt_open"]):
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        opt_stop_periods = st.multiselect("Stop – perioder", [10,20,50], default=st.session_state["opt_stop_periods"])
+    with c2:
+        opt_stop_tfs = st.multiselect("Stop – timeframes", ["5m","10m","15m","30m","60m"], default=st.session_state["opt_stop_tfs"])
+    with c3:
+        opt_allow_after = st.checkbox("Tillåt exit efter original (i optimering)", value=st.session_state["allow_after_default"])
+
+    d1, d2 = st.columns(2)
+    with d1:
+        opt_tp_periods = st.multiselect("TP – perioder", [10,20,50], default=st.session_state["opt_tp_periods"])
+    with d2:
+        opt_tp_tfs = st.multiselect("TP – timeframes", ["5m","10m","15m","30m","60m"], default=st.session_state["opt_tp_tfs"])
+
+    opt_post_extend_days = st.number_input("Sökfönster i optimering (dagar)", min_value=1, max_value=90, value=int(post_extend_days), step=1)
+
+    st.session_state["opt_stop_periods"] = list(opt_stop_periods)
+    st.session_state["opt_stop_tfs"] = list(opt_stop_tfs)
+    st.session_state["opt_tp_periods"] = list(opt_tp_periods)
+    st.session_state["opt_tp_tfs"] = list(opt_tp_tfs)
+    st.session_state["opt_open"] = True
+
+    run_opt = st.button("Kör optimering")
+
+if run_opt:
+    if start_equity <= 0 or alloc <= 0:
+        st.warning("Ange startkapital och allokering > 0% för optimering.")
+    else:
+        with st.spinner("Optimerar kombinationer…"):
+            opt_df = optimize_settings(
+                trades_df=df,
+                start_equity=float(start_equity),
+                allocation_pct=float(alloc),
+                allow_after_original=bool(opt_allow_after),
+                post_extend_days=int(opt_post_extend_days),
+                stop_periods=list(map(int, st.session_state["opt_stop_periods"])),
+                stop_tfs=list(map(str, st.session_state["opt_stop_tfs"])),
+                tp_periods=list(map(int, st.session_state["opt_tp_periods"])),
+                tp_tfs=list(map(str, st.session_state["opt_tp_tfs"])),
+            )
+        st.session_state["opt_results"] = opt_df
+        st.session_state["opt_open"] = True
+
+opt_df = st.session_state["opt_results"]
+if opt_df is not None:
+    if opt_df.empty:
+        st.info("Inga resultat (kontrollera att du har händelser och giltiga inställningar).")
+    else:
+        st.subheader("Bästa kombinationer (sorterat på slutligt konto)")
+        show_cols = ["final_eq","total_ret_pct","total_realized","avg_roi",
+                     "winrate_pct","wins","losses","total_trades",
+                     "stop_period","stop_tf","tp_period","tp_tf","post_extend_days"]
+        st.dataframe(opt_df[show_cols].head(15), use_container_width=True)
+        best = opt_df.iloc[0]
+        st.success(
+            f"Bästa (just nu): Stop {int(best['stop_period'])}/{best['stop_tf']}, "
+            f"TP {int(best['tp_period'])}/{best['tp_tf']}, Fönster {int(best['post_extend_days'])} dgr → "
+            f"Slutligt konto: {best['final_eq']:,.2f} USDT "
+            f"({best['total_ret_pct']:.2f}%), Realiserad PnL: {best['total_realized']:,.2f}, "
+            f"Gen. ROI: {best['avg_roi']:.2f}%, Winrate: {best['winrate_pct']:.2f}% "
+            f"({int(best['wins'])}W / {int(best['losses'])}L, N={int(best['total_trades'])})"
+        )
