@@ -2,6 +2,10 @@
 # Bybit PERPETUALS (USDT-linear) – Trades, PnL, MA-Stop & MA-TP (CLOSE-only) + Winrate (med counts)
 # + Konto-saldo & Positionsstorlek (risk i % av konto)
 # Innehåller: jämförelse, exit-markörer + chart, auto-optimering, projektion, Plotly-fallback, WIN/LOSS-COUNTS
+# Uppdateringar:
+# - MA-Stop: CLOSE ≤/≥ MA (inkluderande jämförelse) och sökning börjar först efter entry-candle
+# - MA-TP: kräver vinstläge efter entry (pris i riktning först), söker MA-korsning efter det, och börjar efter entry-candle
+# - Kandidatval: tidigaste av STOP/TP gäller och avslutar lotten (ingen fortsatt jakt efter annan exit)
 
 import time
 import hmac
@@ -302,6 +306,10 @@ def build_ma_df(symbol: str, timeframe_sel: str, ma_period: int, t_first_entry: 
 
 # ====== VILLKOR (CLOSE-only) ======
 def first_stop_close_condition(ma_df: pd.DataFrame, t_entry: int, t_deadline: int, pos_side: str, tf: str) -> Tuple[bool, Optional[float], Optional[int]]:
+    """
+    MA-STOP: för long → CLOSE <= MA, för short → CLOSE >= MA.
+    Börjar söka efter entry-candle (t_entry + 1×TF).
+    """
     if ma_df.empty:
         return False, None, None
     tf_ms = timeframe_to_ms(tf)
@@ -311,39 +319,52 @@ def first_stop_close_condition(ma_df: pd.DataFrame, t_entry: int, t_deadline: in
         return False, None, None
 
     if pos_side == "long":
-        hit = sub[sub["close"] < sub["ma"]]
+        hit = sub[sub["close"] <= sub["ma"]]  # inkluderande
     else:
-        hit = sub[sub["close"] > sub["ma"]]
+        hit = sub[sub["close"] >= sub["ma"]]
 
     if not hit.empty:
         row = hit.iloc[0]
         return True, float(row["close"]), int(row["ts"])
     return False, None, None
 
-def first_tp_after_original_close_condition(
-    ma_df: pd.DataFrame, t_entry: int, t_deadline: int, pos_side: str, tf: str, original_tp_price: float
+def first_tp_after_profit_close_condition(
+    ma_df: pd.DataFrame,
+    t_entry: int,
+    t_deadline: int,
+    pos_side: str,
+    tf: str,
+    entry_price: float
 ) -> Tuple[bool, Optional[float], Optional[int]]:
-    if ma_df.empty or not original_tp_price or original_tp_price <= 0:
+    """
+    MA-TP: kräver att priset varit i vinstläge efter entry, därefter exit på MA-korsning.
+    Long: först HIGH >= entry, därefter CLOSE <= MA.
+    Short: först LOW  <= entry, därefter CLOSE >= MA.
+    Söker först efter entry-candle (t_entry + 1×TF).
+    """
+    if ma_df.empty or not entry_price or entry_price <= 0:
         return False, None, None
 
-    sub = ma_df[(ma_df["ts"] >= t_entry) & (ma_df["ts"] <= t_deadline)].dropna(subset=["ma"]).copy()
+    tf_ms = timeframe_to_ms(tf)
+    start_ts = t_entry + tf_ms
+    sub = ma_df[(ma_df["ts"] >= start_ts) & (ma_df["ts"] <= t_deadline)].dropna(subset=["ma"]).copy()
     if sub.empty:
         return False, None, None
 
-    if pos_side == "long":
-        passed = sub[sub["high"] >= float(original_tp_price)]
+    if str(pos_side).lower() == "long":
+        passed = sub[sub["high"] >= float(entry_price)]
         if passed.empty:
             return False, None, None
         p_ts = int(passed.iloc[0]["ts"])
         sub2 = sub[sub["ts"] >= p_ts]
-        tp_hit = sub2[sub2["close"] < sub2["ma"]]
+        tp_hit = sub2[sub2["close"] <= sub2["ma"]]
     else:
-        passed = sub[sub["low"] <= float(original_tp_price)]
+        passed = sub[sub["low"] <= float(entry_price)]
         if passed.empty:
             return False, None, None
         p_ts = int(passed.iloc[0]["ts"])
         sub2 = sub[sub["ts"] >= p_ts]
-        tp_hit = sub2[sub2["close"] > sub2["ma"]]
+        tp_hit = sub2[sub2["close"] >= sub2["ma"]]
 
     if not tp_hit.empty:
         row = tp_hit.iloc[0]
@@ -362,6 +383,10 @@ def compute_linear_fifo_pnl_and_events(
     allow_after_original: bool = False,
     post_extend_days: int = 14,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Strategi: för varje lot väljs den tidigaste av kandidat-exitar (STOP/TP).
+    STOP/TP definieras via MA-korsning (CLOSE-only). TP kräver "vinstläge" efter entry.
+    """
     if trades_df.empty:
         summary = pd.DataFrame(columns=["symbol","realized_pnl_usdt","closed_notional_usdt","roi_pct"])
         events = pd.DataFrame(columns=[
@@ -422,6 +447,7 @@ def compute_linear_fifo_pnl_and_events(
                 realized_pnl -= fee
                 continue
 
+            # ====== Köpfill (stänger short först) ======
             if side.lower() == "buy":
                 qty_to_match = qty
                 fee_remaining = fee
@@ -452,19 +478,21 @@ def compute_linear_fifo_pnl_and_events(
 
                     if tp_enabled:
                         ma_tp_df = get_ma(symbol, tp_tf, tp_ma_period)
-                        hit, tpp, tpts = first_tp_after_original_close_condition(ma_tp_df, int(lot["ts"]), d_tp, "short", tp_tf, base_close_price)
+                        hit, tpp, tpts = first_tp_after_profit_close_condition(
+                            ma_tp_df, int(lot["ts"]), d_tp, "short", tp_tf, entry_price=float(lot["price"])
+                        )
                         if hit:
                             candidates.append(("TP", int(tpts), float(tpp)))
 
                     if candidates:
-                        candidates.sort(key=lambda x: x[1])
+                        candidates.sort(key=lambda x: x[1])  # tidigaste vinner
                         chosen_type, chosen_ts, chosen_price = candidates[0][0], int(candidates[0][1]), float(candidates[0][2])
                         stop_hit = (chosen_type == "STOP")
                         tp_hit = (chosen_type == "TP")
                         after_original_flag = chosen_ts > base_close_ts
 
                     entry_notional = lot["price"] * take
-                    pnl_core = (lot["price"] - chosen_price) * take
+                    pnl_core = (lot["price"] - chosen_price) * take  # short: entry - exit
 
                     fee_part = fee * (take / qty)
                     pnl = pnl_core - fee_part
@@ -494,6 +522,7 @@ def compute_linear_fifo_pnl_and_events(
                     realized_pnl -= fee_remaining
                     longs.append({"qty": qty_to_match, "price": price, "ts": ts})
 
+            # ====== Säljfill (stänger long först) ======
             elif side.lower() == "sell":
                 qty_to_match = qty
                 fee_remaining = fee
@@ -524,19 +553,21 @@ def compute_linear_fifo_pnl_and_events(
 
                     if tp_enabled:
                         ma_tp_df = get_ma(symbol, tp_tf, tp_ma_period)
-                        hit, tpp, tpts = first_tp_after_original_close_condition(ma_tp_df, int(lot["ts"]), d_tp, "long", tp_tf, base_close_price)
+                        hit, tpp, tpts = first_tp_after_profit_close_condition(
+                            ma_tp_df, int(lot["ts"]), d_tp, "long", tp_tf, entry_price=float(lot["price"])
+                        )
                         if hit:
                             candidates.append(("TP", int(tpts), float(tpp)))
 
                     if candidates:
-                        candidates.sort(key=lambda x: x[1])
+                        candidates.sort(key=lambda x: x[1])  # tidigaste vinner
                         chosen_type, chosen_ts, chosen_price = candidates[0][0], int(candidates[0][1]), float(candidates[0][2])
                         stop_hit = (chosen_type == "STOP")
                         tp_hit = (chosen_type == "TP")
                         after_original_flag = chosen_ts > base_close_ts
 
                     entry_notional = lot["price"] * take
-                    pnl_core = (chosen_price - lot["price"]) * take
+                    pnl_core = (chosen_price - lot["price"]) * take  # long: exit - entry
 
                     fee_part = fee * (take / qty)
                     pnl = pnl_core - fee_part
@@ -729,7 +760,7 @@ def optimize_settings(
 # ===== UI ======
 st.set_page_config(page_title="Bybit Perps – PnL, MA-Stop & MA-TP (Close-only) + Saldo & Position Size",
                    page_icon="📊", layout="wide")
-st.title("📊 Bybit Perps – PnL, MA-Stop & MA-TP (Close-only)")
+st.title("📊 Bybit Perps – PnL, MA-Stop & MA-TP (CLOSE-only)")
 st.caption("Jämför Original vs MA-strategi, se exit-markörer, optimera parametrar, projektera framåt, följ winrate – och beräkna positionsstorlek baserat på aktuell kontobalans.")
 
 with st.sidebar:
@@ -780,7 +811,7 @@ with st.sidebar:
     stop_tf = st.selectbox("Timeframe (Stop)", ["5m","10m","15m","30m","60m"], index=2)
 
     st.header("MA-TP (CLOSE)")
-    use_ma_tp = st.checkbox("Aktivera MA-TP (kräver passage av original-TP)", value=True)
+    use_ma_tp = st.checkbox("Aktivera MA-TP (kräver vinstläge före exit)", value=True)
     tp_ma_period = st.selectbox("MA-period (TP)", [10, 20, 50], index=1)
     tp_tf = st.selectbox("Timeframe (TP)", ["5m","10m","15m","30m","60m"], index=2)
 
