@@ -5,3 +5,4 @@ yfinance
 pandas-datareader
 lxml
 requests
+plotly
