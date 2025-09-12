@@ -73,6 +73,35 @@ def bybit_get(endpoint: str, params: Dict[str, Any], api_key: Optional[str]=None
     r.raise_for_status()
     return r.json()
 
+# ===== HÄMTA PERPETUAL-TRADES (funktion) =====
+def fetch_all_linear_trades(api_key: str, api_secret: str, start_time_ms: int | None, end_time_ms: int | None) -> List[Dict[str, Any]]:
+    trades: List[Dict[str, Any]] = []
+    cursor = None
+    safety_loops = 0
+    while True:
+        params: Dict[str, Any] = {"category": "linear", "limit": 200}
+        if cursor:
+            params["cursor"] = cursor
+        if start_time_ms:
+            params["startTime"] = start_time_ms
+        if end_time_ms:
+            params["endTime"] = end_time_ms
+
+        data = bybit_get("/v5/execution/list", params, api_key, api_secret)
+        if str(data.get("retCode")) != "0":
+            raise RuntimeError(f"Bybit API fel: {data.get('retCode')} - {data.get('retMsg')}")
+        result = data.get("result") or {}
+        rows = result.get("list") or []
+        trades.extend(rows)
+        cursor = result.get("nextPageCursor")
+        if not cursor:
+            break
+        safety_loops += 1
+        if safety_loops > 500:
+            break
+        time.sleep(0.15)
+    return trades
+
 # ====== SALDO (Wallet balance) ======
 def fetch_wallet_balance(api_key: str, api_secret: str, account_type: str = "UNIFIED", coin: Optional[str] = "USDT") -> Dict[str, Any]:
     """
@@ -829,7 +858,6 @@ def optimize_settings(
     if trades_df is None or trades_df.empty or start_equity <= 0 or allocation_pct <= 0:
         return pd.DataFrame(results)
 
-    # Total kombinationer (grovt estimat)
     total = len(stop_periods)*len(stop_tfs)*len(tp_periods)*len(tp_tfs)
     if use_multi_tp_presets:
         total *= max(1, len(multi_tp_presets))
@@ -858,7 +886,7 @@ def optimize_settings(
                             fpr, trades_df, sp, stf, tp, ttf,
                             allow_after_original, post_extend_days,
                             start_equity, allocation_pct,
-                            multi_tp_preset=None  # single-TP
+                            multi_tp_preset=None
                         )
                         results.append(res)
                         cnt += 1
@@ -1049,7 +1077,7 @@ if fetch_btn:
             start_ms, end_ms = end_ms, start_ms
     with st.spinner("Hämtar Bybit-perpetuals…"):
         try:
-            raw_trades = fetch_all_linear_trades(API_KEY, API_SECRET, start_ms, end_ms=None)  # end_ms None = allt framåt
+            raw_trades = fetch_all_linear_trades(API_KEY, API_SECRET, start_ms, end_ms)
         except Exception as e:
             st.error(f"Kunde inte hämta trades: {e}")
             st.stop()
@@ -1058,35 +1086,6 @@ if fetch_btn:
         st.stop()
     st.session_state["trades_df"] = pd.DataFrame(raw_trades)
     st.session_state["opt_results"] = None
-
-# ===== HÄMTA PERPETUAL-TRADES (funktion – oförändrad) =====
-def fetch_all_linear_trades(api_key: str, api_secret: str, start_time_ms: int | None, end_time_ms: int | None) -> List[Dict[str, Any]]:
-    trades: List[Dict[str, Any]] = []
-    cursor = None
-    safety_loops = 0
-    while True:
-        params: Dict[str, Any] = {"category": "linear", "limit": 200}
-        if cursor:
-            params["cursor"] = cursor
-        if start_time_ms:
-            params["startTime"] = start_time_ms
-        if end_time_ms:
-            params["endTime"] = end_time_ms
-
-        data = bybit_get("/v5/execution/list", params, api_key, api_secret)
-        if str(data.get("retCode")) != "0":
-            raise RuntimeError(f"Bybit API fel: {data.get('retCode')} - {data.get('retMsg')}")
-        result = data.get("result") or {}
-        rows = result.get("list") or []
-        trades.extend(rows)
-        cursor = result.get("nextPageCursor")
-        if not cursor:
-            break
-        safety_loops += 1
-        if safety_loops > 500:
-            break
-        time.sleep(0.15)
-    return trades
 
 # ===== HUVUDVY – TRADES =====
 df = st.session_state.get("trades_df")
