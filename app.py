@@ -10,6 +10,8 @@ import streamlit as st
 import ccxt
 import pandas as pd
 import yfinance as yf
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 try:
     from pandas_datareader import data as pdr
 except Exception:
@@ -559,12 +561,13 @@ with st.sidebar:
         index=0
     )
 
+    # Flera timeframes
     if data_source == "Bybit (USDT-perps, ccxt)":
-        timeframe = st.selectbox("Timeframe", ["1m","3m","5m","15m","30m","1h","2h","4h","6h","12h","1d"], index=3)
+        timeframes = st.multiselect("Timeframes", ["1m","3m","5m","15m","30m","1h","2h","4h","6h","12h","1d"], default=["15m","1h","4h"])
     elif data_source in ("Yahoo Finance (aktier/ETF/cert)", "Yahoo Finance (alla .ST, beta)", "Avanza (CSV-upload)"):
-        timeframe = st.selectbox("Timeframe (Yahoo/Avanza)", ["15m","30m","1h","1d"], index=0)
+        timeframes = st.multiselect("Timeframes (Yahoo/Avanza)", ["15m","30m","1h","1d"], default=["15m","1h"])
     else:
-        timeframe = "1d"
+        timeframes = ["1d"]
         st.info("Stooq stöder daglig data (1d).")
 
     # Symboler
@@ -613,6 +616,11 @@ with st.sidebar:
         st.caption("Stooq är daglig data. Exempel: AAPL.US, MSFT.US")
         symbols_text = st.text_area("Tickers (Stooq, daglig)", value="AAPL.US, MSFT.US", height=70)
         stooq_symbols = [s.strip() for s in symbols_text.split(",") if s.strip()]
+
+    # Parallell-kontroller
+    st.markdown("— Körning —")
+    parallel = st.checkbox("Parallell skanning över TF", value=True)
+    max_workers = st.number_input("Max trådar (per TF)", 1, 8, 3, 1)
 
     # Top/Bottom-källa
     top_source = st.selectbox(
@@ -685,193 +693,245 @@ status = st.empty()
 progress = st.progress(0, text="Väntar …")
 
 # =========================
+# Funktion som skannar EN timeframe (utan Streamlit-anrop)
+# =========================
+
+def scan_one_timeframe(data_source, tf, limit_candles, params):
+    hits = []
+    ranked = []
+    exchange = None
+
+    if data_source == "Bybit (USDT-perps, ccxt)":
+        exchange = ccxt.bybit({"enableRateLimit": True, "options": {"defaultType": "swap"}})
+        exchange.load_markets()
+        all_syms = load_usdt_perp_symbols(exchange) or []
+        if params["scan_all"]:
+            ranked = all_syms[:]
+        else:
+            vols = []
+            for s in all_syms:
+                try:
+                    ohlcv_tmp = fetch_ohlcv_safe(exchange, s, tf, limit=max(params["lookback_vol"], 300))
+                    vols.append((atr_like_vol(ohlcv_tmp, params["lookback_vol"]), s))
+                except Exception:
+                    pass
+            vols.sort(reverse=True); ranked = [s for _, s in vols[:params["top_n"]]]
+    elif data_source in ("Yahoo Finance (aktier/ETF/cert)", "Yahoo Finance (alla .ST, beta)", "Avanza (CSV-upload)"):
+        ranked = params["yf_symbols"][:]
+    else:
+        ranked = params["stooq_symbols"][:]
+
+    for s in ranked:
+        try:
+            # OHLCV
+            if data_source == "Bybit (USDT-perps, ccxt)":
+                ohlcv = fetch_ohlcv_safe(exchange, s, tf, limit=limit_candles)
+            elif data_source in ("Yahoo Finance (aktier/ETF/cert)", "Yahoo Finance (alla .ST, beta)", "Avanza (CSV-upload)"):
+                ohlcv = fetch_ohlcv_yf(s, tf, limit=limit_candles)
+            else:
+                ohlcv = fetch_ohlcv_stooq(s, tf, limit=limit_candles)
+            if not ohlcv or len(ohlcv) < 210:
+                continue
+
+            closes = [x[4] for x in ohlcv]; last_px = closes[-1]
+            side, seg_start = current_trend_and_segment_start(ohlcv)
+
+            if params["trend_mode"] == "Upptrend":
+                do_up, do_down = True, False
+            elif params["trend_mode"] == "Nedtrend":
+                do_up, do_down = False, True
+            else:
+                if side == 'up': do_up, do_down = True, False
+                elif side == 'down': do_up, do_down = False, True
+                else:
+                    if params["allow_range_scan"]:
+                        do_up, do_down = True, True; seg_start = max(0, len(ohlcv) - 300)
+                    else:
+                        do_up, do_down = False, False
+
+            # Bursts
+            bursts_up, bursts_down = set(), set()
+            if params["use_explosive"]:
+                if params["enforce_min_tf_15m"] and tf in ("1m","3m","5m","10m"):
+                    bursts_up, bursts_down = set(), set()
+                else:
+                    bursts_up, bursts_down = detect_explosive_windows_dir(
+                        ohlcv, win=params["burst_win"], min_move_pct=params["burst_min_move"],
+                        atr_mult=params["burst_atr_mult"], vol_mult=params["burst_vol_mult"]
+                    )
+
+            # === Upptrend ===
+            if do_up and seg_start is not None:
+                setup, seq = find_best_up_hit_segment(
+                    ohlcv, seg_start, params["include_turn_wick"],
+                    params["use_segment_extreme"],
+                    params["tol_886"], params["tol_618"], invalidate_on_new_low=params["invalidate_low"],
+                    max_bars=params["max_bars"], require_under_top_now=params["require_under_top_now"],
+                    use_explosive=params["use_explosive"], bursts_up=bursts_up, burst_lookback=params["burst_lookback"]
+                )
+                if setup and seq:
+                    fr = setup["freeze_idx"]; t_idx = seq["touch_idx"]; r_idx = seq["retrace_idx"]
+                    ema_ok=True; b10=b20=b50=0
+                    if params["ema_surf_enable"]:
+                        ok1, a10, a20, a50 = check_ema_surf(ohlcv, fr+1, t_idx, "up", params["ema_close_only"], params["ema_allow10"], params["ema_allow20"], params["ema_strict50"])
+                        ok2, b10_, b20_, b50_ = check_ema_surf(ohlcv, t_idx+1, r_idx, "up", params["ema_close_only"], params["ema_allow10"], params["ema_allow20"], params["ema_strict50"])
+                        ema_ok = ok1 and ok2
+                        b10=a10+b10_; b20=a20+b20_; b50=a50+b50_
+                    if ema_ok:
+                        tbar = ohlcv[t_idx]; rbar = ohlcv[r_idx]
+                        low_lvl = min(setup["level618"], setup["level886"]); hi_lvl = max(setup["level618"], setup["level886"])
+                        tv_url = build_tradingview_url(s) if data_source == "Bybit (USDT-perps, ccxt)" else None
+                        diag = compute_quality_and_debug(ohlcv, setup, seq, bursts_up, params["burst_win"], params["burst_lookback"], mode="up")
+                        reject = False
+                        if diag["Span/ATR14"] is not None and diag["Span/ATR14"] < params["min_span_atr"]: reject = True
+                        if not reject and params["max_burst_to_pivot"] and diag["Burst→Pivot bars"] is not None and diag["Burst→Pivot bars"] > params["max_burst_to_pivot"]: reject = True
+                        if not reject and diag["Advance ratio"] < params["min_adv_ratio_up"]: reject = True
+                        if not reject and diag["Quality"] < params["min_quality"]: reject = True
+                        if not reject:
+                            rec = {
+                                "Symbol": s, "TF": tf, "Trend": "Up",
+                                "Top": setup["top"], "Bottom": setup["bottom"],
+                                "0.886": setup["level886"], "0.618": setup["level618"],
+                                "Touch 0.886 (UTC)": ts(tbar[0]),
+                                "Retrace 0.618 (UTC)": ts(rbar[0]),
+                                "Bars touch→retrace": r_idx - t_idx,
+                                "Last": last_px,
+                                "Dist% till 0.886": pct_dist(last_px, setup["level886"]),
+                                "Dist% till 0.618": pct_dist(last_px, setup["level618"]),
+                                "Mellan 0.618–0.886 nu": bool(low_lvl <= last_px <= hi_lvl),
+                                "Under TOP nu": (last_px < setup["top"]),
+                                "Span/ATR14": diag["Span/ATR14"],
+                                "Advance ratio": diag["Advance ratio"],
+                                "Quality": diag["Quality"],
+                                "EMA surf OK": ema_ok,
+                                "Breach10": b10, "Breach20": b20, "Breach50": b50
+                            }
+                            if params["show_diag"]:
+                                rec["Burst→Pivot bars"] = diag["Burst→Pivot bars"]
+                                rec["Burst move %"] = diag["Burst move %"]
+                            if tv_url: rec = {"TradingView": tv_url, **rec}
+                            hits.append(rec)
+
+            # === Nedtrend ===
+            if do_down and seg_start is not None:
+                setup, seq = find_best_down_hit_segment(
+                    ohlcv, seg_start, params["include_turn_wick"],
+                    params["use_segment_extreme"],
+                    params["tol_886"], params["tol_618"], invalidate_on_new_high=params["invalidate_high"],
+                    max_bars=params["max_bars"], require_over_bottom_now=params["require_over_bottom_now"],
+                    use_explosive=params["use_explosive"], bursts_down=bursts_down, burst_lookback=params["burst_lookback"]
+                )
+                if setup and seq:
+                    fr = setup["freeze_idx"]; t_idx = seq["touch_idx"]; r_idx = seq["retrace_idx"]
+                    ema_ok=True; b10=b20=b50=0
+                    if params["ema_surf_enable"]:
+                        ok1, a10, a20, a50 = check_ema_surf(ohlcv, fr+1, t_idx, "down", params["ema_close_only"], params["ema_allow10"], params["ema_allow20"], params["ema_strict50"])
+                        ok2, b10_, b20_, b50_ = check_ema_surf(ohlcv, t_idx+1, r_idx, "down", params["ema_close_only"], params["ema_allow10"], params["ema_allow20"], params["ema_strict50"])
+                        ema_ok = ok1 and ok2
+                        b10=a10+b10_; b20=a20+b20_; b50=a50+b50_
+                    if ema_ok:
+                        tbar = ohlcv[t_idx]; rbar = ohlcv[r_idx]
+                        low_lvl = min(setup["level618"], setup["level886"]); hi_lvl = max(setup["level618"], setup["level886"])
+                        tv_url = build_tradingview_url(s) if data_source == "Bybit (USDT-perps, ccxt)" else None
+                        diag = compute_quality_and_debug(ohlcv, setup, seq, bursts_down, params["burst_win"], params["burst_lookback"], mode="down")
+                        reject = False
+                        if diag["Span/ATR14"] is not None and diag["Span/ATR14"] < params["min_span_atr"]: reject = True
+                        if not reject and params["max_burst_to_pivot"] and diag["Burst→Pivot bars"] is not None and diag["Burst→Pivot bars"] > params["max_burst_to_pivot"]: reject = True
+                        if not reject and diag["Advance ratio"] < params["min_adv_ratio_down"]: reject = True
+                        if not reject and diag["Quality"] < params["min_quality"]: reject = True
+                        if not reject:
+                            rec = {
+                                "Symbol": s, "TF": tf, "Trend": "Down",
+                                "Top": setup["top"], "Bottom": setup["bottom"],
+                                "0.886": setup["level886"], "0.618": setup["level618"],
+                                "Touch 0.886 (UTC)": ts(tbar[0]),
+                                "Retrace 0.618 (UTC)": ts(rbar[0]),
+                                "Bars touch→retrace": r_idx - t_idx,
+                                "Last": last_px,
+                                "Dist% till 0.886": pct_dist(last_px, setup["level886"]),
+                                "Dist% till 0.618": pct_dist(last_px, setup["level618"]),
+                                "Mellan 0.618–0.886 nu": bool(low_lvl <= last_px <= hi_lvl),
+                                "Över BOTTOM nu": (last_px > setup["bottom"]),
+                                "Span/ATR14": diag["Span/ATR14"],
+                                "Advance ratio": diag["Advance ratio"],
+                                "Quality": diag["Quality"],
+                                "EMA surf OK": ema_ok,
+                                "Breach10": b10, "Breach20": b20, "Breach50": b50
+                            }
+                            if params["show_diag"]:
+                                rec["Burst→Pivot bars"] = diag["Burst→Pivot bars"]
+                                rec["Burst move %"] = diag["Burst move %"]
+                            if tv_url: rec = {"TradingView": tv_url, **rec}
+                            hits.append(rec)
+        except Exception:
+            # swallow symbol-level fel, fortsätt
+            pass
+
+    return hits
+
+# =========================
 # Körning
 # =========================
 
 if run_btn:
     try:
-        ranked = []; exchange = None
-        if data_source == "Bybit (USDT-perps, ccxt)":
-            exchange = ccxt.bybit({"enableRateLimit": True, "options": {"defaultType": "swap"}})
-            exchange.load_markets()
-            all_syms = load_usdt_perp_symbols(exchange) or []
-            if scan_all:
-                ranked = all_syms[:]; st.caption(f"Skannar ALLA USDT-perps ({len(ranked)})")
-            else:
-                st.info("Rankar volatilitet …")
-                vols = []
-                for idx, s in enumerate(all_syms):
+        status.write("Förbereder parametrar …")
+
+        params = {
+            "scan_all": scan_all if data_source == "Bybit (USDT-perps, ccxt)" else True,
+            "lookback_vol": locals().get("lookback_vol", 288),
+            "top_n": locals().get("top_n", 50),
+            "yf_symbols": locals().get("yf_symbols", []),
+            "stooq_symbols": locals().get("stooq_symbols", []),
+            "trend_mode": trend_mode,
+            "allow_range_scan": allow_range_scan,
+            "include_turn_wick": include_turn_wick,
+            "use_segment_extreme": use_segment_extreme,
+            "tol_886": tol_886, "tol_618": tol_618, "max_bars": max_bars,
+            "invalidate_low": invalidate_low, "invalidate_high": invalidate_high,
+            "require_under_top_now": require_under_top_now, "require_over_bottom_now": require_over_bottom_now,
+            "use_explosive": use_explosive, "burst_win": burst_win, "burst_min_move": burst_min_move,
+            "burst_atr_mult": burst_atr_mult, "burst_vol_mult": burst_vol_mult, "burst_lookback": burst_lookback,
+            "enforce_min_tf_15m": enforce_min_tf_15m,
+            "show_diag": show_diag, "min_quality": min_quality, "min_span_atr": min_span_atr,
+            "min_adv_ratio_up": min_adv_ratio_up, "min_adv_ratio_down": min_adv_ratio_down,
+            "max_burst_to_pivot": max_burst_to_pivot,
+            "ema_surf_enable": ema_surf_enable, "ema_close_only": ema_close_only,
+            "ema_allow10": ema_allow10, "ema_allow20": ema_allow20, "ema_strict50": ema_strict50,
+        }
+
+        all_hits = []
+        completed = 0
+        total = max(1, len(timeframes))
+
+        if parallel and len(timeframes) > 1:
+            # Begränsa trådar; om Bybit används, var extra snäll
+            workers = min(max_workers, len(timeframes))
+            if data_source == "Bybit (USDT-perps, ccxt)":
+                workers = min(workers, 2)  # var försiktig med rate limits
+            status.write(f"Kör parallellt över {len(timeframes)} TF (workers={workers}) …")
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futs = {pool.submit(scan_one_timeframe, data_source, tf, limit_candles, params): tf for tf in timeframes}
+                for fut in as_completed(futs):
+                    tf = futs[fut]
                     try:
-                        ohlcv_tmp = fetch_ohlcv_safe(exchange, s, timeframe, limit=max(lookback_vol, 300))
-                        vols.append((atr_like_vol(ohlcv_tmp, lookback_vol), s))
-                    except Exception:
-                        pass
-                    progress.progress(int((idx+1)/max(1,len(all_syms))*100), text=f"Vol-rankar {idx+1}/{len(all_syms)}")
-                vols.sort(reverse=True); ranked = [s for _, s in vols[:top_n]]
-                st.caption(f"Topp {top_n} mest volatila ({timeframe})")
-        elif data_source in ("Yahoo Finance (aktier/ETF/cert)", "Yahoo Finance (alla .ST, beta)", "Avanza (CSV-upload)"):
-            ranked = yf_symbols[:]; st.caption(f"Skannar {len(ranked)} Yahoo/Avanza-tickers")
+                        hits = fut.result()
+                        all_hits.extend(hits)
+                    except Exception as e:
+                        st.warning(f"{tf} misslyckades: {e}")
+                    completed += 1
+                    progress.progress(int(completed/total*100), text=f"Klar med {completed}/{total} TF")
         else:
-            ranked = stooq_symbols[:]; st.caption(f"Skannar {len(ranked)} Stooq-tickers (daglig)")
-
-        hits = []
-        for i, s in enumerate(ranked):
-            try:
-                # OHLCV
-                if data_source == "Bybit (USDT-perps, ccxt)":
-                    ohlcv = fetch_ohlcv_safe(exchange, s, timeframe, limit=limit_candles)
-                elif data_source in ("Yahoo Finance (aktier/ETF/cert)", "Yahoo Finance (alla .ST, beta)", "Avanza (CSV-upload)"):
-                    ohlcv = fetch_ohlcv_yf(s, timeframe, limit=limit_candles)
-                else:
-                    ohlcv = fetch_ohlcv_stooq(s, timeframe, limit=limit_candles)
-                if not ohlcv or len(ohlcv) < 210:
-                    progress.progress(int((i+1)/max(1,len(ranked))*100), text=f"Skannar {i+1}/{len(ranked)}")
-                    continue
-
-                closes = [x[4] for x in ohlcv]; last_px = closes[-1]
-                side, seg_start = current_trend_and_segment_start(ohlcv)
-
-                if trend_mode == "Upptrend":
-                    do_up, do_down = True, False
-                elif trend_mode == "Nedtrend":
-                    do_up, do_down = False, True
-                else:
-                    if side == 'up': do_up, do_down = True, False
-                    elif side == 'down': do_up, do_down = False, True
-                    else:
-                        if allow_range_scan:
-                            do_up, do_down = True, True; seg_start = max(0, len(ohlcv) - 300)
-                        else:
-                            do_up, do_down = False, False
-
-                # Bursts
-                bursts_up, bursts_down = set(), set()
-                if use_explosive:
-                    if enforce_min_tf_15m and timeframe in ("1m","3m","5m","10m"):
-                        bursts_up, bursts_down = set(), set()
-                    else:
-                        bursts_up, bursts_down = detect_explosive_windows_dir(
-                            ohlcv, win=burst_win, min_move_pct=burst_min_move,
-                            atr_mult=burst_atr_mult, vol_mult=burst_vol_mult
-                        )
-
-                # === Upptrend ===
-                if do_up and seg_start is not None:
-                    setup, seq = find_best_up_hit_segment(
-                        ohlcv, seg_start, include_turn_wick,
-                        use_segment_extreme,
-                        tol_886, tol_618, invalidate_on_new_low=invalidate_low,
-                        max_bars=max_bars, require_under_top_now=require_under_top_now,
-                        use_explosive=use_explosive, bursts_up=bursts_up, burst_lookback=burst_lookback
-                    )
-                    if setup and seq:
-                        fr = setup["freeze_idx"]; t_idx = seq["touch_idx"]; r_idx = seq["retrace_idx"]
-                        # EMA-surf filter (både freeze→touch och touch→retrace)
-                        ema_ok=True; b10=b20=b50=0
-                        if ema_surf_enable:
-                            ok1, a10, a20, a50 = check_ema_surf(ohlcv, fr+1, t_idx, "up", ema_close_only, ema_allow10, ema_allow20, ema_strict50)
-                            ok2, b10_, b20_, b50_ = check_ema_surf(ohlcv, t_idx+1, r_idx, "up", ema_close_only, ema_allow10, ema_allow20, ema_strict50)
-                            ema_ok = ok1 and ok2
-                            b10=a10+b10_; b20=a20+b20_; b50=a50+b50_
-                        if not ema_ok:
-                            pass
-                        else:
-                            tbar = ohlcv[t_idx]; rbar = ohlcv[r_idx]
-                            low_lvl = min(setup["level618"], setup["level886"]); hi_lvl = max(setup["level618"], setup["level886"])
-                            tv_url = build_tradingview_url(s) if data_source == "Bybit (USDT-perps, ccxt)" else None
-                            diag = compute_quality_and_debug(ohlcv, setup, seq, bursts_up, burst_win, burst_lookback, mode="up")
-                            reject = False
-                            if diag["Span/ATR14"] is not None and diag["Span/ATR14"] < min_span_atr: reject = True
-                            if not reject and max_burst_to_pivot and diag["Burst→Pivot bars"] is not None and diag["Burst→Pivot bars"] > max_burst_to_pivot: reject = True
-                            if not reject and diag["Advance ratio"] < min_adv_ratio_up: reject = True
-                            if not reject and diag["Quality"] < min_quality: reject = True
-                            if not reject:
-                                rec = {
-                                    "Symbol": s, "TF": timeframe, "Trend": "Up",
-                                    "Top": setup["top"], "Bottom": setup["bottom"],
-                                    "0.886": setup["level886"], "0.618": setup["level618"],
-                                    "Touch 0.886 (UTC)": ts(tbar[0]),
-                                    "Retrace 0.618 (UTC)": ts(rbar[0]),
-                                    "Bars touch→retrace": r_idx - t_idx,
-                                    "Last": last_px,
-                                    "Dist% till 0.886": pct_dist(last_px, setup["level886"]),
-                                    "Dist% till 0.618": pct_dist(last_px, setup["level618"]),
-                                    "Mellan 0.618–0.886 nu": bool(low_lvl <= last_px <= hi_lvl),
-                                    "Under TOP nu": (last_px < setup["top"]),
-                                    "Span/ATR14": diag["Span/ATR14"],
-                                    "Advance ratio": diag["Advance ratio"],
-                                    "Quality": diag["Quality"],
-                                    "EMA surf OK": ema_ok,
-                                    "Breach10": b10, "Breach20": b20, "Breach50": b50
-                                }
-                                if show_diag:
-                                    rec["Burst→Pivot bars"] = diag["Burst→Pivot bars"]
-                                    rec["Burst move %"] = diag["Burst move %"]
-                                if tv_url: rec = {"TradingView": tv_url, **rec}
-                                hits.append(rec)
-
-                # === Nedtrend ===
-                if do_down and seg_start is not None:
-                    setup, seq = find_best_down_hit_segment(
-                        ohlcv, seg_start, include_turn_wick,
-                        use_segment_extreme,
-                        tol_886, tol_618, invalidate_on_new_high=invalidate_high,
-                        max_bars=max_bars, require_over_bottom_now=require_over_bottom_now,
-                        use_explosive=use_explosive, bursts_down=bursts_down, burst_lookback=burst_lookback
-                    )
-                    if setup and seq:
-                        fr = setup["freeze_idx"]; t_idx = seq["touch_idx"]; r_idx = seq["retrace_idx"]
-                        ema_ok=True; b10=b20=b50=0
-                        if ema_surf_enable:
-                            ok1, a10, a20, a50 = check_ema_surf(ohlcv, fr+1, t_idx, "down", ema_close_only, ema_allow10, ema_allow20, ema_strict50)
-                            ok2, b10_, b20_, b50_ = check_ema_surf(ohlcv, t_idx+1, r_idx, "down", ema_close_only, ema_allow10, ema_allow20, ema_strict50)
-                            ema_ok = ok1 and ok2
-                            b10=a10+b10_; b20=a20+b20_; b50=a50+b50_
-                        if not ema_ok:
-                            pass
-                        else:
-                            tbar = ohlcv[t_idx]; rbar = ohlcv[r_idx]
-                            low_lvl = min(setup["level618"], setup["level886"]); hi_lvl = max(setup["level618"], setup["level886"])
-                            tv_url = build_tradingview_url(s) if data_source == "Bybit (USDT-perps, ccxt)" else None
-                            diag = compute_quality_and_debug(ohlcv, setup, seq, bursts_down, burst_win, burst_lookback, mode="down")
-                            reject = False
-                            if diag["Span/ATR14"] is not None and diag["Span/ATR14"] < min_span_atr: reject = True
-                            if not reject and max_burst_to_pivot and diag["Burst→Pivot bars"] is not None and diag["Burst→Pivot bars"] > max_burst_to_pivot: reject = True
-                            if not reject and diag["Advance ratio"] < min_adv_ratio_down: reject = True
-                            if not reject and diag["Quality"] < min_quality: reject = True
-                            if not reject:
-                                rec = {
-                                    "Symbol": s, "TF": timeframe, "Trend": "Down",
-                                    "Top": setup["top"], "Bottom": setup["bottom"],
-                                    "0.886": setup["level886"], "0.618": setup["level618"],
-                                    "Touch 0.886 (UTC)": ts(tbar[0]),
-                                    "Retrace 0.618 (UTC)": ts(rbar[0]),
-                                    "Bars touch→retrace": r_idx - t_idx,
-                                    "Last": last_px,
-                                    "Dist% till 0.886": pct_dist(last_px, setup["level886"]),
-                                    "Dist% till 0.618": pct_dist(last_px, setup["level618"]),
-                                    "Mellan 0.618–0.886 nu": bool(low_lvl <= last_px <= hi_lvl),
-                                    "Över BOTTOM nu": (last_px > setup["bottom"]),
-                                    "Span/ATR14": diag["Span/ATR14"],
-                                    "Advance ratio": diag["Advance ratio"],
-                                    "Quality": diag["Quality"],
-                                    "EMA surf OK": ema_ok,
-                                    "Breach10": b10, "Breach20": b20, "Breach50": b50
-                                }
-                                if show_diag:
-                                    rec["Burst→Pivot bars"] = diag["Burst→Pivot bars"]
-                                    rec["Burst move %"] = diag["Burst move %"]
-                                if tv_url: rec = {"TradingView": tv_url, **rec}
-                                hits.append(rec)
-
-            except Exception:
-                pass
-
-            progress.progress(int((i+1)/max(1,len(ranked))*100), text=f"Skannar {i+1}/{len(ranked)}")
+            status.write(f"Kör sekventiellt över {len(timeframes)} TF …")
+            for tf in timeframes:
+                hits = scan_one_timeframe(data_source, tf, limit_candles, params)
+                all_hits.extend(hits)
+                completed += 1
+                progress.progress(int(completed/total*100), text=f"Klar med {completed}/{total} TF")
 
         # Resultat
-        if hits:
-            df = pd.DataFrame(hits)
+        if all_hits:
+            df = pd.DataFrame(all_hits)
             float_cols = ["Top","Bottom","0.886","0.618","Last","Dist% till 0.886","Dist% till 0.618",
                           "Burst move %","Span/ATR14","Advance ratio","Quality"]
             for col in float_cols:
@@ -891,12 +951,12 @@ if run_btn:
                                "Mellan 0.618–0.886 nu","Under TOP nu","Över BOTTOM nu"]
             cols = [c for c in preferred_order if c in df.columns] + [c for c in df.columns if c not in preferred_order]
             df = df[cols]
-            st.success(f"Klar. Träffar: {len(df)}")
+            st.success(f"Klar. Träffar totalt över {len(timeframes)} TF: {len(df)}")
             col_config = {}
             if "TradingView" in df.columns:
                 col_config["TradingView"] = st.column_config.LinkColumn("TV", help="Öppna i TradingView (BYBIT perps)", display_text="📈")
             st.data_editor(df, hide_index=True, use_container_width=True, column_config=col_config, disabled=True)
         else:
-            st.info("Inga symboler uppfyllde villkoren i vald källa/timeframe.")
+            st.info("Inga symboler uppfyllde villkoren i valda timeframes.")
     except Exception as e:
         st.error(f"Fel: {e}")
