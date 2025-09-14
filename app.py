@@ -86,6 +86,10 @@ def fetch_all_linear_trades(
     limit: int = 1000,
     max_pages: int = 200
 ) -> List[Dict[str, Any]]:
+    """
+    Hämtar utförda fills (executions) för USDT-linear-perps från Bybit v5 /v5/execution/list.
+    Viktigt: använd paramnamnen startTime/endTime (ms-epoch, UTC).
+    """
     out: List[Dict[str, Any]] = []
     cursor: Optional[str] = None
     pages = 0
@@ -94,11 +98,11 @@ def fetch_all_linear_trades(
         params: Dict[str, Any] = {
             "category": "linear",
             "limit": int(limit),
-            "order": "DESC",          # (ok att lämna, ignoreras om inte stöds)
+            "order": "DESC",
         }
         if symbol:
             params["symbol"] = symbol
-        # 🔧 RÄTT PARAMNAMN FÖR EXECUTIONS:
+        # RÄTT paramnamn
         if start_time_ms is not None:
             params["startTime"] = int(start_time_ms)
         if end_time_ms is not None:
@@ -112,11 +116,12 @@ def fetch_all_linear_trades(
 
         result = data.get("result") or {}
         rows = result.get("list") or []
+
         for r in rows:
             try:
                 out.append({
                     "symbol":        r.get("symbol"),
-                    "side":          r.get("side"),
+                    "side":          r.get("side"),                 # "Buy"/"Sell"
                     "execQty":       float(r.get("execQty", 0) or 0),
                     "execPrice":     float(r.get("execPrice", 0) or 0),
                     "execValue":     float(r.get("execValue", 0) or 0),
@@ -126,7 +131,7 @@ def fetch_all_linear_trades(
                     "execId":        r.get("execId"),
                     "execType":      r.get("execType"),
                     "isMaker":       bool(r.get("isMaker")),
-                    "execTime":      int(r.get("execTime", 0) or 0),
+                    "execTime":      int(r.get("execTime", 0) or 0),   # ms epoch
                 })
             except Exception:
                 continue
@@ -135,10 +140,45 @@ def fetch_all_linear_trades(
         pages += 1
         if not cursor or pages >= max_pages:
             break
+
         time.sleep(0.06)
 
     if out:
         out = sorted(out, key=lambda x: (x.get("symbol",""), x.get("execTime", 0)))
+    return out
+
+def fetch_all_linear_trades_chunked(
+    api_key: str,
+    api_secret: str,
+    start_time_ms: Optional[int],
+    end_time_ms: Optional[int]
+) -> List[Dict[str, Any]]:
+    """
+    Delar upp förfrågan i 7-dagarsfönster och anropar fetch_all_linear_trades för varje fönster.
+    """
+    # Om inget intervall anges: hämta enligt Bybits standard (senaste ~7 dagar)
+    if not start_time_ms and not end_time_ms:
+        return fetch_all_linear_trades(api_key, api_secret, None, None)
+
+    now_ms = int(time.time() * 1000)
+
+    # Om bara ena sidan anges, fyll ut till ett 7-dagarsfönster
+    if start_time_ms and not end_time_ms:
+        end_time_ms = min(start_time_ms + 7*24*3600*1000, now_ms)
+    if end_time_ms and not start_time_ms:
+        start_time_ms = max(end_time_ms - 7*24*3600*1000, 0)
+
+    t0 = int(min(start_time_ms, end_time_ms))
+    t1 = int(max(start_time_ms, end_time_ms))
+
+    out: List[Dict[str, Any]] = []
+    window = 7*24*3600*1000  # 7 dagar i ms
+    cur_start = t0
+    while cur_start <= t1:
+        cur_end = min(cur_start + window - 1, t1)  # -1 för att undvika överlapp
+        out.extend(fetch_all_linear_trades(api_key, api_secret, cur_start, cur_end))
+        cur_start = cur_end + 1
+        time.sleep(0.15)  # var snäll mot API:t
     return out
 
 # ====== SALDO (Wallet balance) ======
@@ -203,6 +243,7 @@ def timeframe_to_ms(tf: str) -> int:
 # ====== KLINES (public) ======
 @st.cache_data(show_spinner=False, ttl=600)
 def fetch_klines_linear(symbol: str, interval: str, start_ms: int, end_ms: int) -> pd.DataFrame:
+    # OBS: kline använder "start"/"end" (inte startTime/endTime)
     if interval not in {"1","3","5","15","30","60","120","240","360","720","D","W","M"}:
         raise ValueError("Ogiltigt intervall för Bybit v5.")
     out_rows: List[Dict[str, Any]] = []
@@ -842,7 +883,7 @@ def optimize_settings(
 st.set_page_config(page_title="Bybit Perps – PnL, MA-Stop & MA-TP (Close-only) + Saldo",
                    page_icon="📊", layout="wide")
 st.title("📊 Bybit Perps – PnL, MA-Stop & MA-TP (Close-only)")
-st.caption("Jämför Original vs MA-strategi (inkl. Multi-TP), se exit-markörer, optimera parametrar, projektera framåt och följ winrate. Position size-räknaren är borttagen enligt önskemål.")
+st.caption("Jämför Original vs MA-strategi (inkl. Multi-TP), se exit-markörer, optimera parametrar, projektera framåt och följ winrate. Position size-räknaren är borttagen.")
 
 with st.sidebar:
     st.header("Konto")
@@ -880,7 +921,7 @@ with st.sidebar:
     if range_mode == "Dagar bakåt":
         c1, c2 = st.columns(2)
         with c1:
-            days_back_from = st.number_input("Från (dagar bakåt)", min_value=0, max_value=3650, value=0, step=1)
+            days_back_from = st.number_input("Från (dagar bakåt)", min_value=0, max_value=3650, value=1, step=1)
         with c2:
             days_back_to = st.number_input("Till (dagar bakåt)", min_value=0, max_value=3650, value=0, step=1)
         st.caption("Lämna båda 0 för att hämta allt som API:t returnerar.")
@@ -957,6 +998,7 @@ if fetch_btn:
         if date_start and date_end:
             dt_start = datetime.combine(date_start, time_start or dtime(0,0), tzinfo=tz)
             dt_end   = datetime.combine(date_end,   time_end   or dtime(23,59), tzinfo=tz)
+            # Bybit v5 tar ms-epoch UTC; timestamp() returnerar korrekt ms oavsett DST
             start_ms = int(dt_start.timestamp() * 1000)
             end_ms   = int(dt_end.timestamp() * 1000)
             if start_ms > end_ms:
