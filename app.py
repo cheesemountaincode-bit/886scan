@@ -1,9 +1,10 @@
 # app.py
 # Bybit PERPETUALS (USDT-linear) – Trades, PnL, MA-Stop & MA-TP (CLOSE-only) + Winrate (med counts)
-# + Konto-saldo & Positionsstorlek (risk i % av konto)
+# + Konto-saldo
 # Innehåller: jämförelse, exit-markörer + chart, auto-optimering, projektion, Plotly-fallback, WIN/LOSS-COUNTS
 # + Multi-TP (TP1/TP2/TP3) med delstängningar (andel av kvarvarande) via MA-korsning eller Original-close
 # + Stöd i Auto-optimering för Multi-TP via fördefinierade andelspaket
+# + Datumintervall (Europe/Stockholm) för hämtning av trades
 
 import time
 import hmac
@@ -11,6 +12,8 @@ import hashlib
 from typing import Any, Dict, List, Tuple, Optional
 from urllib.parse import urlencode
 from dataclasses import dataclass
+from datetime import datetime, time as dtime, timedelta
+from zoneinfo import ZoneInfo
 
 import requests
 import pandas as pd
@@ -72,6 +75,78 @@ def bybit_get(endpoint: str, params: Dict[str, Any], api_key: Optional[str]=None
     r = requests.get(url, headers=headers, timeout=30)
     r.raise_for_status()
     return r.json()
+
+# ====== TRADES (executions) ======
+def fetch_all_linear_trades(
+    api_key: str,
+    api_secret: str,
+    start_time_ms: Optional[int] = None,
+    end_time_ms: Optional[int] = None,
+    symbol: Optional[str] = None,
+    limit: int = 1000,
+    max_pages: int = 200
+) -> List[Dict[str, Any]]:
+    """
+    Hämtar utförda fills (executions) för USDT-linear-perps från Bybit v5.
+    - Paginering med cursor tills slut eller max_pages.
+    - Om start/end inte anges hämtas "senaste" enligt Bybits standard.
+    Returnerar en lista av dicts med fält som appen förväntar sig.
+    """
+    out: List[Dict[str, Any]] = []
+    cursor: Optional[str] = None
+    pages = 0
+
+    while True:
+        params: Dict[str, Any] = {
+            "category": "linear",
+            "limit": int(limit),
+            "order": "DESC",
+        }
+        if symbol:
+            params["symbol"] = symbol
+        if start_time_ms is not None:
+            params["start"] = int(start_time_ms)
+        if end_time_ms is not None:
+            params["end"] = int(end_time_ms)
+        if cursor:
+            params["cursor"] = cursor
+
+        data = bybit_get("/v5/execution/list", params, api_key, api_secret)
+        if str(data.get("retCode")) != "0":
+            break
+
+        result = data.get("result") or {}
+        rows = result.get("list") or []
+
+        for r in rows:
+            try:
+                out.append({
+                    "symbol":        r.get("symbol"),
+                    "side":          r.get("side"),                 # "Buy"/"Sell"
+                    "execQty":       float(r.get("execQty", 0) or 0),
+                    "execPrice":     float(r.get("execPrice", 0) or 0),
+                    "execValue":     float(r.get("execValue", 0) or 0),
+                    "execFee":       float(r.get("execFee", 0) or 0),
+                    "feeCurrency":   r.get("feeCurrency"),
+                    "orderId":       r.get("orderId"),
+                    "execId":        r.get("execId"),
+                    "execType":      r.get("execType"),
+                    "isMaker":       bool(r.get("isMaker")),
+                    "execTime":      int(r.get("execTime", 0) or 0),   # ms epoch
+                })
+            except Exception:
+                continue
+
+        cursor = result.get("nextPageCursor")
+        pages += 1
+        if not cursor or pages >= max_pages:
+            break
+
+        time.sleep(0.06)
+
+    if out:
+        out = sorted(out, key=lambda x: (x.get("symbol",""), x.get("execTime", 0)))
+    return out
 
 def fetch_all_linear_trades_chunked(api_key, api_secret, start_time_ms: int|None, end_time_ms: int|None) -> List[Dict[str, Any]]:
     # Om inget är satt: hämta "senaste 7 dagar" (som idag)
@@ -144,70 +219,6 @@ def fetch_wallet_balance(api_key: str, api_secret: str, account_type: str = "UNI
             "unrealisedPnl": float(c.get("unrealisedPnl", 0)),
         })
     return out
-
-# ====== POSITION SIZE & R/R ======
-def calc_position_size(
-    side: str,
-    entry: float,
-    stop: float,
-    equity: float,
-    risk_pct: float,
-    fee_buffer_pct: float = 0.10,   # t.ex. 0.10% = 0.001
-    leverage: float = 1.0,
-    available: Optional[float] = None
-) -> Dict[str, float]:
-    """
-    USDT-linear: risk ($) per kontrakt ≈ |entry - stop|.
-    qty = (riskbelopp efter buffert) / |entry - stop|
-    """
-    side = (side or "").lower().strip()
-    if entry <= 0 or stop <= 0 or equity <= 0 or risk_pct <= 0:
-        return {"qty": 0.0, "notional": 0.0, "init_margin": 0.0, "risk_amount_usdt": 0.0, "capped": 0.0}
-
-    price_risk = abs(entry - stop)
-    if price_risk <= 0:
-        return {"qty": 0.0, "notional": 0.0, "init_margin": 0.0, "risk_amount_usdt": 0.0, "capped": 0.0}
-
-    risk_amount = equity * (risk_pct / 100.0)
-    effective_risk = risk_amount * (1.0 - (fee_buffer_pct / 100.0))
-    if effective_risk <= 0:
-        effective_risk = risk_amount
-
-    qty = effective_risk / price_risk
-    notional = qty * entry
-    lev = max(1.0, float(leverage))
-    init_margin = notional / lev
-
-    capped = 0.0
-    if available is not None and available > 0:
-        max_notional = float(available) * lev
-        if notional > max_notional:
-            qty_cap = max_notional / entry
-            capped = 1.0
-            qty = qty_cap
-            notional = qty * entry
-            init_margin = notional / lev
-
-    return {
-        "qty": float(qty),
-        "notional": float(notional),
-        "init_margin": float(init_margin),
-        "risk_amount_usdt": float(risk_amount),
-        "capped": float(capped)
-    }
-
-def calc_rr(side: str, entry: float, stop: float, tp: Optional[float]) -> Dict[str, float]:
-    if entry <= 0 or stop <= 0:
-        return {"risk_per_unit": 0.0, "reward_per_unit": 0.0, "rr": 0.0}
-    risk_per_unit = abs(entry - stop)
-    reward_per_unit = 0.0
-    if tp and tp > 0:
-        if str(side).lower() == "long":
-            reward_per_unit = max(0.0, tp - entry)
-        else:
-            reward_per_unit = max(0.0, entry - tp)
-    rr = (reward_per_unit / risk_per_unit) if risk_per_unit > 0 else 0.0
-    return {"risk_per_unit": float(risk_per_unit), "reward_per_unit": float(reward_per_unit), "rr": float(rr)}
 
 # ====== HJÄLP ======
 def _ensure_numeric(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
@@ -322,7 +333,6 @@ def first_stop_close_condition(ma_df: pd.DataFrame, t_entry: int, t_deadline: in
 def first_tp_after_original_close_condition(
     ma_df: pd.DataFrame, t_entry: int, t_deadline: int, pos_side: str, tf: str, original_tp_price: float
 ) -> Tuple[bool, Optional[float], Optional[int]]:
-    # (Behålls för bakåtkompatibilitet om något anropar den, men Multi-TP använder nya funktionen nedan)
     if ma_df.empty or not original_tp_price or original_tp_price <= 0:
         return False, None, None
 
@@ -369,12 +379,6 @@ def first_ma_tp_signal(
     entry_price: float,
     require_profit_first: bool
 ) -> Tuple[bool, Optional[float], Optional[int]]:
-    """
-    Returnerar första (ts, close) för en MA-TP-signal:
-      - Om require_profit_first: kräver att priset gått i vinst efter entry (HIGH≥entry för long, LOW≤entry för short).
-      - Long: CLOSE <= MA   Short: CLOSE >= MA
-      - Söker från nästa bar efter entry.
-    """
     if ma_df.empty:
         return False, None, None
     tf_ms = timeframe_to_ms(tf)
@@ -416,15 +420,6 @@ def compute_linear_fifo_pnl_and_events(
     post_extend_days: int = 14,
     tp_tiers: Optional[List[TPTier]] = None
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Nu med partiella TP (1-3 nivåer). Varje nivå stänger % av kvarvarande qty när dess trigger först inträffar.
-    Triggers:
-      - "MA": egen MA-period/TF, optional profit-first.
-      - "ORIGINAL": inträffar på base_close_ts/price.
-    MA-Stop är alltid hel-exit (stänger allt kvarvarande) när den inträffar först.
-    Tidigaste händelsen i tid appliceras först. Efter en partiell TP fortsätter vi att leta efter framtida triggers
-    för kvarvarande qty tills qty=0 eller en hel-exit (MA-Stop eller Original) tar resten.
-    """
     if trades_df.empty:
         summary = pd.DataFrame(columns=["symbol","realized_pnl_usdt","closed_notional_usdt","roi_pct"])
         events = pd.DataFrame(columns=[
@@ -446,7 +441,6 @@ def compute_linear_fifo_pnl_and_events(
     else:
         df = df.sort_values(by=["symbol"]).reset_index(drop=True)
 
-    # Fallback till gammalt single-TP-beteende om inga tiers ges men tp_enabled=True
     if tp_tiers is None:
         tp_tiers = []
         if tp_enabled:
@@ -482,7 +476,6 @@ def compute_linear_fifo_pnl_and_events(
                 return int(ma_df["ts"].max())
             return int(base_close_ts)
 
-        # === Iterera verkliga fills FIFO ===
         for _, row in g.iterrows():
             side = str(row.get("side") or "")
             qty_filled  = float(row.get("execQty") or 0.0)
@@ -494,7 +487,6 @@ def compute_linear_fifo_pnl_and_events(
                 realized_pnl -= fee
                 continue
 
-            # BUY stänger shorts först
             if side.lower() == "buy":
                 qty_to_match = qty_filled
                 fee_remaining = fee
@@ -505,10 +497,8 @@ def compute_linear_fifo_pnl_and_events(
                     base_close_price = price_fill
                     base_close_ts = ts_fill
 
-                    # Bygg kandidater dynamiskt (MA-STOP + TP-tiers + ORIGINAL)
-                    candidates: List[Tuple[int,str,float,float]] = []  # (ts, tag, price, pct_of_remaining)
+                    candidates: List[Tuple[int,str,float,float]] = []
 
-                    # MA-STOP (hel-exit)
                     if stop_enabled:
                         ma_stop_df = get_ma(symbol, stop_tf, stop_ma_period)
                         d_stop = deadline_ts(ma_stop_df, base_close_ts)
@@ -516,15 +506,12 @@ def compute_linear_fifo_pnl_and_events(
                         if hit:
                             candidates.append((int(st_ts), "STOP_ALL", float(sp), 100.0))
 
-                    # TP-tiers
                     for idx, tier in enumerate(tp_tiers, start=1):
                         if not tier.enabled:
                             continue
                         if tier.mode.upper() == "ORIGINAL":
-                            # original-close som partiell TP-nivå
                             candidates.append((int(base_close_ts), f"TP{idx}_ORIG", float(base_close_price), float(tier.pct_of_remaining)))
                         else:
-                            # MA-TP nivå
                             ma_tp_df = get_ma(symbol, tier.ma_tf, tier.ma_period)
                             d_tp = deadline_ts(ma_tp_df, base_close_ts)
                             hit, tpp, tpts = first_ma_tp_signal(
@@ -535,11 +522,9 @@ def compute_linear_fifo_pnl_and_events(
                             if hit:
                                 candidates.append((int(tpts), f"TP{idx}_MA", float(tpp), float(tier.pct_of_remaining)))
 
-                    # Om inga kandidater: använd ORIGINAL som hel-exit
                     if not candidates:
                         candidates.append((int(base_close_ts), "ORIGINAL_ALL", float(base_close_price), 100.0))
 
-                    # Sortera i tid och applicera partiella exits i kronologi
                     candidates.sort(key=lambda x: x[0])
 
                     remaining = take_total
@@ -556,7 +541,6 @@ def compute_linear_fifo_pnl_and_events(
                         if qty_part <= 1e-12:
                             continue
 
-                        # PnL (short: entry - exit)
                         entry_notional = lot["price"] * qty_part
                         pnl_core = (lot["price"] - ev_price) * qty_part
 
@@ -592,11 +576,10 @@ def compute_linear_fifo_pnl_and_events(
                     if lot["qty"] <= 1e-12:
                         shorts.pop(0)
 
-                if qty_to_match > 0:  # rest öppnar long
+                if qty_to_match > 0:
                     realized_pnl -= fee_remaining
                     longs.append({"qty": qty_to_match, "price": price_fill, "ts": ts_fill})
 
-            # SELL stänger longs först
             elif side.lower() == "sell":
                 qty_to_match = qty_filled
                 fee_remaining = fee
@@ -651,7 +634,6 @@ def compute_linear_fifo_pnl_and_events(
                         if qty_part <= 1e-12:
                             continue
 
-                        # PnL (long: exit - entry)
                         entry_notional = lot["price"] * qty_part
                         pnl_core = (ev_price - lot["price"]) * qty_part
 
@@ -791,11 +773,9 @@ def run_combo(
     allow_after_original: bool,
     post_extend_days: int,
     start_equity: float, alloc: float,
-    # Multi-TP preset: tuple (p1,p2,p3) or None for single-TP behavior
     multi_tp_preset: Optional[Tuple[int,int,int]] = None,
     profit_first_for_ma_tiers: bool = True
 ) -> Dict[str, Any]:
-    # Bygg tp_tiers utifrån preset (om finns), annars single-TP (100%)
     tp_tiers: Optional[List[TPTier]] = None
     if multi_tp_preset is not None:
         p1, p2, p3 = multi_tp_preset
@@ -891,10 +871,10 @@ def optimize_settings(
     return pd.DataFrame(results).sort_values("final_eq", ascending=False).reset_index(drop=True)
 
 # ===== UI ======
-st.set_page_config(page_title="Bybit Perps – PnL, MA-Stop & MA-TP (Close-only) + Saldo & Position Size",
+st.set_page_config(page_title="Bybit Perps – PnL, MA-Stop & MA-TP (Close-only) + Saldo",
                    page_icon="📊", layout="wide")
 st.title("📊 Bybit Perps – PnL, MA-Stop & MA-TP (Close-only)")
-st.caption("Jämför Original vs MA-strategi (inkl. Multi-TP), se exit-markörer, optimera parametrar, projektera framåt, följ winrate – och beräkna positionsstorlek baserat på aktuell kontobalans.")
+st.caption("Jämför Original vs MA-strategi (inkl. Multi-TP), se exit-markörer, optimera parametrar, projektera framåt och följ winrate. Position size-räknaren är borttagen enligt önskemål.")
 
 with st.sidebar:
     st.header("Konto")
@@ -923,16 +903,33 @@ if isinstance(bal, dict) and bal and 'coin' in bal:
     c4.metric("Unrealised PnL", f"{bal['unrealisedPnl']:,.2f} {bal['coin']}")
     st.caption(f"Konto: {bal.get('accountType','?')}")
 else:
-    st.info("Hämta kontosaldo för att använda positionsräknaren.")
+    st.info("Hämta kontosaldo om du vill se saldo ovan.")
 
 with st.sidebar:
     st.header("Tidsintervall (trades)")
-    c1, c2 = st.columns(2)
-    with c1:
-        days_back_from = st.number_input("Från (dagar bakåt)", min_value=0, max_value=3650, value=0, step=1)
-    with c2:
-        days_back_to = st.number_input("Till (dagar bakåt)", min_value=0, max_value=3650, value=0, step=1)
-    st.caption("Lämna båda 0 för att hämta allt som API:t returnerar.")
+    range_mode = st.radio("Välj metod", ["Dagar bakåt", "Datumintervall"], horizontal=True, index=0)
+
+    if range_mode == "Dagar bakåt":
+        c1, c2 = st.columns(2)
+        with c1:
+            days_back_from = st.number_input("Från (dagar bakåt)", min_value=0, max_value=3650, value=0, step=1)
+        with c2:
+            days_back_to = st.number_input("Till (dagar bakåt)", min_value=0, max_value=3650, value=0, step=1)
+        st.caption("Lämna båda 0 för att hämta allt som API:t returnerar.")
+        date_start = date_end = None
+        time_start = time_end = None
+    else:
+        tz = ZoneInfo("Europe/Stockholm")
+        today_local = datetime.now(tz).date()
+        dcol1, dcol2 = st.columns(2)
+        with dcol1:
+            date_start = st.date_input("Startdatum", value=today_local - timedelta(days=7))
+            time_start = st.time_input("Starttid", value=dtime(0, 0))
+        with dcol2:
+            date_end = st.date_input("Slutdatum", value=today_local)
+            time_end = st.time_input("Sluttid", value=dtime(23, 59))
+        days_back_from = days_back_to = 0
+        st.caption("Tider tolkas i Europe/Stockholm.")
 
     st.header("Kapital & Allokering (sim-kurvor)")
     start_equity = st.number_input("Startkapital i USDT", min_value=0.0, value=0.0, step=100.0)
@@ -974,103 +971,29 @@ with st.sidebar:
 
     fetch_btn = st.button("Hämta & simulera trades")
 
-# ===== Position Size-räknare (i huvudvyn, under saldot) =====
-st.divider()
-st.markdown("## Position size & Risk (live mot kontosaldo)")
-
-def _to_float(s: str) -> float:
-    if s is None:
-        return 0.0
-    s = str(s).strip().replace(" ", "").replace(",", ".")
-    import re
-    m = re.search(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", s)
-    try:
-        return float(m.group(0)) if m else 0.0
-    except Exception:
-        return 0.0
-
-for k in ["entry_price_str","stop_price_str","tp_price_str"]:
-    st.session_state.setdefault(k, "")
-
-def _bulk_paste_cb():
-    raw = st.session_state.get("bulk_paste_raw","") or ""
-    tpl = raw.replace(";", " ").replace("/", " ").replace("|", " ").replace("\t", " ")
-    tpl = tpl.replace(",", ".")
-    import re
-    nums = re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", tpl)
-    if len(nums) >= 2:
-        st.session_state["entry_price_str"] = nums[0]
-        st.session_state["stop_price_str"]  = nums[1]
-        if len(nums) >= 3:
-            st.session_state["tp_price_str"] = nums[2]
-        st.toast("Klistrade in entry/stop/TP.", icon="✅")
-
-bal_ok = isinstance(st.session_state.get('acct_balance'), dict) and st.session_state['acct_balance'] and 'coin' in st.session_state['acct_balance']
-if bal_ok:
-    bal = st.session_state['acct_balance']
-    side = st.radio("Riktning", ["long", "short"], horizontal=True, index=0)
-
-    st.text_input(
-        "Snabbklistra (entry stop [tp]) – t.ex. 0.3726 0.3510 0.4180",
-        key="bulk_paste_raw",
-        on_change=_bulk_paste_cb,
-        placeholder="0.3726 0.3510 0.4180"
-    )
-
-    e1, e2, e3, e4 = st.columns(4)
-    with e1:
-        st.text_input("Entry", key="entry_price_str", placeholder="t.ex. 0.3726")
-    with e2:
-        st.text_input("Stop", key="stop_price_str", placeholder="t.ex. 0.3510")
-    with e3:
-        st.text_input("Take Profit (valfritt)", key="tp_price_str", placeholder="t.ex. 0.4180")
-    with e4:
-        leverage = st.number_input("Leverage (kontroll)", min_value=1.0, max_value=100.0, value=5.0, step=1.0)
-
-    entry_price = _to_float(st.session_state.get("entry_price_str",""))
-    stop_price  = _to_float(st.session_state.get("stop_price_str",""))
-    tp_price    = _to_float(st.session_state.get("tp_price_str",""))
-
-    r1, r2 = st.columns(2)
-    with r1:
-        risk_pct = st.number_input("Risk av konto (%)", min_value=0.01, max_value=100.0, value=1.0, step=0.25)
-    with r2:
-        fee_buf = st.number_input("Buffert avgifter/slippage (%)", min_value=0.0, max_value=1.0, value=0.10, step=0.05,
-                                  help="Dras från riskbeloppet för att undvika överskjutande förlust vid stop.")
-
-    if entry_price > 0 and stop_price > 0 and risk_pct > 0:
-        ps = calc_position_size(side, entry_price, stop_price, bal['equity'], risk_pct, fee_buf, leverage, available=bal['available'])
-        rr = calc_rr(side, entry_price, stop_price, tp_price if tp_price > 0 else None)
-
-        k1, k2, k3, k4 = st.columns(4)
-        k1.metric("Riskbelopp", f"{ps['risk_amount_usdt']:,.2f} USDT")
-        k2.metric("Kontraktsmängd (qty)", f"{ps['qty']:,.6f}")
-        k3.metric("Notional", f"{ps['notional']:,.2f} USDT")
-        k4.metric("Init. marginal", f"{ps['init_margin']:,.2f} USDT")
-
-        j1, j2, j3 = st.columns(3)
-        j1.metric("Risk/kontrakt", f"{rr['risk_per_unit']:,.6f} $")
-        j2.metric("Reward/kontrakt", f"{rr['reward_per_unit']:,.6f} $")
-        j3.metric("R:R", f"{rr['rr']:,.2f} R")
-
-        if ps["capped"] > 0:
-            st.warning("Storleken har kapats till tillgänglig marginal × leverage. Minska risk% eller höj leverage/tillgängligt saldo.")
-    else:
-        st.info("Klistra in eller skriv entry, stop och risk% och tryck Enter.")
-else:
-    st.info("Hämta saldo för att aktivera positionsräknaren.")
-
 # ===== HÄMTA TRADES =====
 if fetch_btn:
     start_ms = None
     end_ms = None
     now_ms = int(time.time() * 1000)
-    if days_back_from > 0:
-        start_ms = now_ms - int(days_back_from * 24 * 3600 * 1000)
-    if days_back_to > 0:
-        end_ms = now_ms - int(days_back_to * 24 * 3600 * 1000)
-        if start_ms and end_ms and start_ms > end_ms:
-            start_ms, end_ms = end_ms, start_ms
+
+    if range_mode == "Dagar bakåt":
+        if days_back_from > 0:
+            start_ms = now_ms - int(days_back_from * 24 * 3600 * 1000)
+        if days_back_to > 0:
+            end_ms = now_ms - int(days_back_to * 24 * 3600 * 1000)
+            if start_ms and end_ms and start_ms > end_ms:
+                start_ms, end_ms = end_ms, start_ms
+    else:
+        tz = ZoneInfo("Europe/Stockholm")
+        if date_start and date_end:
+            dt_start = datetime.combine(date_start, time_start or dtime(0,0), tzinfo=tz)
+            dt_end   = datetime.combine(date_end,   time_end   or dtime(23,59), tzinfo=tz)
+            start_ms = int(dt_start.timestamp() * 1000)
+            end_ms   = int(dt_end.timestamp() * 1000)
+            if start_ms > end_ms:
+                start_ms, end_ms = end_ms, start_ms
+
     with st.spinner("Hämtar Bybit-perpetuals…"):
         try:
             raw_trades = fetch_all_linear_trades_chunked(API_KEY, API_SECRET, start_ms, end_ms)
@@ -1109,8 +1032,8 @@ base_avg_roi = (base_total_realized / base_entry_notional * 100.0) if base_entry
 base_w, base_l, base_n, base_winrate = compute_winloss(base_events_df)
 
 # ===== MA-strategi (aktuella val) =====
-if not use_ma_stop and not use_ma_tp:
-    st.info("Aktivera minst en av MA-Stop eller MA-TP för jämförelse.")
+if not use_ma_stop and not use_ma_tp and not (use_multi_tp and tp_tiers_cfg):
+    st.info("Aktivera minst en av MA-Stop, MA-TP eller Multi-TP för jämförelse.")
     st.stop()
 
 sim_pnl_df, sim_events_df = compute_linear_fifo_pnl_and_events(
@@ -1118,12 +1041,12 @@ sim_pnl_df, sim_events_df = compute_linear_fifo_pnl_and_events(
     stop_enabled=use_ma_stop,
     stop_ma_period=int(stop_ma_period),
     stop_tf=str(stop_tf),
-    tp_enabled=use_ma_tp,
+    tp_enabled=use_ma_tp or bool(use_multi_tp),
     tp_ma_period=int(tp_ma_period),
     tp_tf=str(tp_tf),
     allow_after_original=bool(allow_after),
     post_extend_days=int(post_extend_days),
-    tp_tiers=tp_tiers_cfg  # Multi-TP (None => single-TP fallback)
+    tp_tiers=tp_tiers_cfg  # Multi-TP (None => single-TP fallback om use_ma_tp=True)
 )
 sim_total_realized = float(sim_pnl_df["realized_pnl_usdt"].sum()) if not sim_pnl_df.empty else 0.0
 sim_entry_notional = float(sim_pnl_df["closed_notional_usdt"].sum()) if not sim_pnl_df.empty else 0.0
@@ -1220,7 +1143,6 @@ def build_markers_df(events: pd.DataFrame) -> pd.DataFrame:
     m = events[events["exit_type"].isin(["STOP_ALL","ORIGINAL_ALL","TP1_MA","TP2_MA","TP3_MA","TP1_ORIG","TP2_ORIG","TP3_ORIG"])].copy()
     if m.empty:
         return pd.DataFrame(columns=["symbol","event","ts","time_utc","price","pnl_usdt","r","after_original","side_close"])
-    # Mappa taggar till kortare eventnamn
     def _map_event(x: str) -> str:
         if x == "STOP_ALL": return "MA_STOP"
         if "_MA" in x: return x.replace("_MA","")
@@ -1397,6 +1319,7 @@ with st.expander("Visa inställningar för optimering", expanded=st.session_stat
     run_opt = st.button("Kör optimering")
 
 if run_opt:
+    alloc = float(allocation_pct_input) / 100.0 if start_equity > 0 else 0.0
     if start_equity <= 0 or alloc <= 0:
         st.warning("Ange startkapital och allokering > 0% för optimering.")
     else:
