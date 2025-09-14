@@ -86,12 +86,6 @@ def fetch_all_linear_trades(
     limit: int = 1000,
     max_pages: int = 200
 ) -> List[Dict[str, Any]]:
-    """
-    Hämtar utförda fills (executions) för USDT-linear-perps från Bybit v5.
-    - Paginering med cursor tills slut eller max_pages.
-    - Om start/end inte anges hämtas "senaste" enligt Bybits standard.
-    Returnerar en lista av dicts med fält som appen förväntar sig.
-    """
     out: List[Dict[str, Any]] = []
     cursor: Optional[str] = None
     pages = 0
@@ -100,14 +94,15 @@ def fetch_all_linear_trades(
         params: Dict[str, Any] = {
             "category": "linear",
             "limit": int(limit),
-            "order": "DESC",
+            "order": "DESC",          # (ok att lämna, ignoreras om inte stöds)
         }
         if symbol:
             params["symbol"] = symbol
+        # 🔧 RÄTT PARAMNAMN FÖR EXECUTIONS:
         if start_time_ms is not None:
-            params["start"] = int(start_time_ms)
+            params["startTime"] = int(start_time_ms)
         if end_time_ms is not None:
-            params["end"] = int(end_time_ms)
+            params["endTime"] = int(end_time_ms)
         if cursor:
             params["cursor"] = cursor
 
@@ -117,12 +112,11 @@ def fetch_all_linear_trades(
 
         result = data.get("result") or {}
         rows = result.get("list") or []
-
         for r in rows:
             try:
                 out.append({
                     "symbol":        r.get("symbol"),
-                    "side":          r.get("side"),                 # "Buy"/"Sell"
+                    "side":          r.get("side"),
                     "execQty":       float(r.get("execQty", 0) or 0),
                     "execPrice":     float(r.get("execPrice", 0) or 0),
                     "execValue":     float(r.get("execValue", 0) or 0),
@@ -132,7 +126,7 @@ def fetch_all_linear_trades(
                     "execId":        r.get("execId"),
                     "execType":      r.get("execType"),
                     "isMaker":       bool(r.get("isMaker")),
-                    "execTime":      int(r.get("execTime", 0) or 0),   # ms epoch
+                    "execTime":      int(r.get("execTime", 0) or 0),
                 })
             except Exception:
                 continue
@@ -141,36 +135,10 @@ def fetch_all_linear_trades(
         pages += 1
         if not cursor or pages >= max_pages:
             break
-
         time.sleep(0.06)
 
     if out:
         out = sorted(out, key=lambda x: (x.get("symbol",""), x.get("execTime", 0)))
-    return out
-
-def fetch_all_linear_trades_chunked(api_key, api_secret, start_time_ms: int|None, end_time_ms: int|None) -> List[Dict[str, Any]]:
-    # Om inget är satt: hämta "senaste 7 dagar" (som idag)
-    if not start_time_ms and not end_time_ms:
-        return fetch_all_linear_trades(api_key, api_secret, None, None)
-
-    now_ms = int(time.time() * 1000)
-    if start_time_ms and not end_time_ms:
-        end_time_ms = min(start_time_ms + 7*24*3600*1000, now_ms)
-    if end_time_ms and not start_time_ms:
-        start_time_ms = max(end_time_ms - 7*24*3600*1000, 0)
-
-    out: List[Dict[str, Any]] = []
-    win = 7*24*3600*1000  # 7 dagar i ms
-    t0 = int(min(start_time_ms, end_time_ms))
-    t1 = int(max(start_time_ms, end_time_ms))
-
-    cur_start = t0
-    while cur_start < t1:
-        cur_end = min(cur_start + win, t1)
-        out.extend(fetch_all_linear_trades(api_key, api_secret, cur_start, cur_end))
-        # +1 ms för att undvika överlapp när execTime==cur_end
-        cur_start = cur_end + 1
-        time.sleep(0.15)
     return out
 
 # ====== SALDO (Wallet balance) ======
