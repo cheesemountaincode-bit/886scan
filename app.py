@@ -73,34 +73,30 @@ def bybit_get(endpoint: str, params: Dict[str, Any], api_key: Optional[str]=None
     r.raise_for_status()
     return r.json()
 
-# ===== HÄMTA PERPETUAL-TRADES (funktion) =====
-def fetch_all_linear_trades(api_key: str, api_secret: str, start_time_ms: int | None, end_time_ms: int | None) -> List[Dict[str, Any]]:
-    trades: List[Dict[str, Any]] = []
-    cursor = None
-    safety_loops = 0
-    while True:
-        params: Dict[str, Any] = {"category": "linear", "limit": 200}
-        if cursor:
-            params["cursor"] = cursor
-        if start_time_ms:
-            params["startTime"] = start_time_ms
-        if end_time_ms:
-            params["endTime"] = end_time_ms
+def fetch_all_linear_trades_chunked(api_key, api_secret, start_time_ms: int|None, end_time_ms: int|None) -> List[Dict[str, Any]]:
+    # Om inget är satt: hämta "senaste 7 dagar" (som idag)
+    if not start_time_ms and not end_time_ms:
+        return fetch_all_linear_trades(api_key, api_secret, None, None)
 
-        data = bybit_get("/v5/execution/list", params, api_key, api_secret)
-        if str(data.get("retCode")) != "0":
-            raise RuntimeError(f"Bybit API fel: {data.get('retCode')} - {data.get('retMsg')}")
-        result = data.get("result") or {}
-        rows = result.get("list") or []
-        trades.extend(rows)
-        cursor = result.get("nextPageCursor")
-        if not cursor:
-            break
-        safety_loops += 1
-        if safety_loops > 500:
-            break
+    now_ms = int(time.time() * 1000)
+    if start_time_ms and not end_time_ms:
+        end_time_ms = min(start_time_ms + 7*24*3600*1000, now_ms)
+    if end_time_ms and not start_time_ms:
+        start_time_ms = max(end_time_ms - 7*24*3600*1000, 0)
+
+    out: List[Dict[str, Any]] = []
+    win = 7*24*3600*1000  # 7 dagar i ms
+    t0 = int(min(start_time_ms, end_time_ms))
+    t1 = int(max(start_time_ms, end_time_ms))
+
+    cur_start = t0
+    while cur_start < t1:
+        cur_end = min(cur_start + win, t1)
+        out.extend(fetch_all_linear_trades(api_key, api_secret, cur_start, cur_end))
+        # +1 ms för att undvika överlapp när execTime==cur_end
+        cur_start = cur_end + 1
         time.sleep(0.15)
-    return trades
+    return out
 
 # ====== SALDO (Wallet balance) ======
 def fetch_wallet_balance(api_key: str, api_secret: str, account_type: str = "UNIFIED", coin: Optional[str] = "USDT") -> Dict[str, Any]:
@@ -1077,7 +1073,7 @@ if fetch_btn:
             start_ms, end_ms = end_ms, start_ms
     with st.spinner("Hämtar Bybit-perpetuals…"):
         try:
-            raw_trades = fetch_all_linear_trades(API_KEY, API_SECRET, start_ms, end_ms)
+            raw_trades = fetch_all_linear_trades_chunked(API_KEY, API_SECRET, start_ms, end_ms)
         except Exception as e:
             st.error(f"Kunde inte hämta trades: {e}")
             st.stop()
